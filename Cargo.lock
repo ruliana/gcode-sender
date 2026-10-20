@@ -396,6 +396,7 @@ dependencies = [
 name = "grbl-sim"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix 0.30.1",
 ]
 

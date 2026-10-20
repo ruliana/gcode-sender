@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -536,6 +536,19 @@ impl Simulator {
         s.reply("");
         s.banner();
         s.reply("[MSG:Reset to continue]");
+    }
+
+    /// Frees the port after the sender has closed it.
+    ///
+    /// Serial libraries open ports in exclusive mode, which the kernel
+    /// clears when the last handle closes. The simulator keeps its own
+    /// handle open, so without this a second sender could not open the
+    /// port after the first exits (unless it runs as root).
+    pub fn release_port(&self) {
+        // SAFETY: TIOCNXCL takes no argument and the fd is owned by self.
+        unsafe {
+            libc::ioctl(self._slave.as_raw_fd(), libc::TIOCNXCL);
+        }
     }
 
     pub fn set_block_duration(&self, d: Duration) {

@@ -92,6 +92,7 @@ impl Harness {
     pub async fn kill_server(&mut self) {
         if let Some(mut child) = self.server.take() {
             child.kill().await.unwrap();
+            self.sim.release_port();
         }
     }
 
