@@ -13,15 +13,15 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_util::codec::{Decoder, FramedRead};
 use tracing::{debug, info, warn};
 
-use crate::bounds;
-use crate::gcode::Interpreter;
+use crate::bounds::{self, Bounds};
+use crate::gcode::{Interpreter, Modal};
 use crate::grbl::{self, FirmwareKind, Response, Status, realtime};
 use crate::program::ProgramLine;
 use crate::store::{JobRecord, JobState, JobStore, LineError, now_ms};
@@ -95,10 +95,36 @@ type Reply<T> = oneshot::Sender<Result<T, ControlError>>;
 enum Command {
     Start(String, Reply<JobRecord>),
     Pause(String, Reply<JobRecord>),
-    Resume(String, Reply<JobRecord>),
+    Resume(String, ResumeOptions, Reply<JobRecord>),
     Stop(String, Reply<JobRecord>),
     Delete(String, Reply<()>),
     Machine(MachineAction, Reply<()>),
+}
+
+/// What to do differently when resuming a job that is not active.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeOptions {
+    /// Restart at this file line, or the first line of code after it,
+    /// instead of backing up from the saved progress.
+    pub from_line: Option<usize>,
+    /// Lift the tool before moving back to the work.
+    pub retract: Option<Retract>,
+}
+
+/// Lift the tool, travel above the resume point, and plunge back to it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retract {
+    /// Safe Z in machine coordinates, in millimetres. It must not be below
+    /// the tool's current Z or the resume point's Z.
+    pub z: f64,
+    /// Plunge feed in millimetres per minute. Defaults to the program's
+    /// feed rate at the resume point.
+    pub plunge_feed: Option<f64>,
+    /// Seconds to wait for the spindle to reach speed before plunging.
+    /// Keep it below `--ack-timeout-ms`.
+    pub dwell_s: Option<f64>,
 }
 
 /// Things an operator can ask of the machine outside a job.
@@ -139,8 +165,12 @@ impl ControllerHandle {
     pub async fn pause(&self, id: String) -> Result<JobRecord, ControlError> {
         self.call(|r| Command::Pause(id, r)).await
     }
-    pub async fn resume(&self, id: String) -> Result<JobRecord, ControlError> {
-        self.call(|r| Command::Resume(id, r)).await
+    pub async fn resume(
+        &self,
+        id: String,
+        options: ResumeOptions,
+    ) -> Result<JobRecord, ControlError> {
+        self.call(|r| Command::Resume(id, options, r)).await
     }
     pub async fn stop(&self, id: String) -> Result<JobRecord, ControlError> {
         self.call(|r| Command::Stop(id, r)).await
@@ -342,12 +372,12 @@ impl Actor {
                     "the machine is not connected".into(),
                 )));
             }
-            Command::Resume(id, r) if self.is_interrupted(&id) => {
+            Command::Resume(id, _, r) if self.is_resumable(&id) => {
                 let _ = r.send(Err(ControlError::Unavailable(
                     "the machine is not connected".into(),
                 )));
             }
-            Command::Pause(id, r) | Command::Resume(id, r) | Command::Stop(id, r) => {
+            Command::Pause(id, r) | Command::Resume(id, _, r) | Command::Stop(id, r) => {
                 let _ = r.send(self.inactive_error(&id));
             }
             Command::Delete(id, r) => {
@@ -361,9 +391,16 @@ impl Actor {
         }
     }
 
-    fn is_interrupted(&self, id: &str) -> bool {
+    /// A job that ended before it finished and can be continued.
+    fn is_resumable(&self, id: &str) -> bool {
         self.job.is_none()
-            && matches!(self.store.get(id), Ok(Some(j)) if j.state == JobState::Interrupted)
+            && matches!(
+                self.store.get(id),
+                Ok(Some(j)) if matches!(
+                    j.state,
+                    JobState::Interrupted | JobState::Stopped | JobState::Failed
+                )
+            )
     }
 
     fn inactive_error(&self, id: &str) -> Result<JobRecord, ControlError> {
@@ -735,8 +772,8 @@ impl Actor {
                 }
                 let _ = reply.send(result.map(|_| self.active_record()));
             }
-            Command::Resume(id, reply) if self.is_interrupted(&id) => {
-                let result = self.resume_interrupted(s, &id);
+            Command::Resume(id, options, reply) if self.is_resumable(&id) => {
+                let result = self.resume_job(s, &id, &options);
                 let ok = result.is_ok();
                 let _ = reply.send(result);
                 if ok {
@@ -747,8 +784,13 @@ impl Actor {
                 let result = self.machine_action(s, action).await?;
                 let _ = reply.send(result);
             }
-            Command::Resume(id, reply) => {
-                let result = self.check_active(&id, &[JobState::Paused]);
+            Command::Resume(id, options, reply) => {
+                let mut result = self.check_active(&id, &[JobState::Paused]);
+                if result.is_ok() && (options.from_line.is_some() || options.retract.is_some()) {
+                    result = Err(ControlError::Invalid(
+                        "from_line and retract only apply to a job that is not active".into(),
+                    ));
+                }
                 if result.is_ok() {
                     if let Some(job) = &mut self.job {
                         job.resume_pending = true;
@@ -858,12 +900,7 @@ impl Actor {
         let Some(limits) = self.store.bounds()? else {
             return Ok(());
         };
-        let status = self.machine.status.as_ref();
-        let three = |v: Option<&Vec<f64>>| v.filter(|v| v.len() >= 3).map(|v| [v[0], v[1], v[2]]);
-        let (Some(position), Some(offset)) = (
-            three(status.and_then(|st| st.machine_position.as_ref())),
-            three(status.and_then(|st| st.work_offset.as_ref())),
-        ) else {
+        let (Some(position), Some(offset)) = self.known_position() else {
             return Err(ControlError::Unavailable(
                 "boundaries are set but the machine position or work offset has not been reported yet; try again".into(),
             ));
@@ -871,14 +908,20 @@ impl Actor {
         bounds::check(&limits, lines, position, offset).map_err(ControlError::Invalid)
     }
 
-    /// Continues a job that was interrupted by a lost connection, a restart
-    /// of the server, or a reset of the controller.
+    /// Continues a job that ended early: interrupted by a lost connection,
+    /// a restart of the server or a reset of the controller, or stopped or
+    /// failed by an operator or an alarm.
     ///
     /// The saved progress can lag the controller, and a reset throws away
     /// whatever was still in its planner, so the job backs up past the
     /// planner depth. Re-running absolute moves is harmless; incremental
     /// ones are not, so those programs cannot be resumed.
-    fn resume_interrupted(&mut self, s: &Session, id: &str) -> Result<JobRecord, ControlError> {
+    fn resume_job(
+        &mut self,
+        s: &Session,
+        id: &str,
+        options: &ResumeOptions,
+    ) -> Result<JobRecord, ControlError> {
         let Some(mut record) = self.store.get(id)? else {
             return Err(ControlError::NotFound);
         };
@@ -886,11 +929,19 @@ impl Actor {
         let lines = self.store.program(id)?;
         self.check_program(s, &lines)?;
 
-        let index = record
-            .acked_lines
-            .saturating_sub(s.planner_blocks + 1)
-            .min(lines.len().saturating_sub(1));
-        let mut machine = Interpreter::new([0.0; 3], [0.0; 3]);
+        let index = match options.from_line {
+            Some(from) => lines.iter().position(|l| l.number >= from).ok_or_else(|| {
+                ControlError::Invalid(format!("line {from} is past the end of the program"))
+            })?,
+            None => record
+                .acked_lines
+                .saturating_sub(s.planner_blocks + 1)
+                .min(lines.len().saturating_sub(1)),
+        };
+
+        let (position, offset) = self.known_position();
+        let mut machine =
+            Interpreter::new(position.unwrap_or([0.0; 3]), offset.unwrap_or([0.0; 3]));
         for line in &lines[..index] {
             machine.step(&line.text).map_err(|e| {
                 ControlError::Invalid(format!(
@@ -906,6 +957,19 @@ impl Actor {
             )));
         }
 
+        let preamble = match &options.retract {
+            None => machine.modal.preamble(),
+            Some(retract) => {
+                let (Some(position), Some(_)) = (position, offset) else {
+                    return Err(ControlError::Unavailable(
+                        "the machine position or work offset has not been reported yet; try again"
+                            .into(),
+                    ));
+                };
+                self.retract_lines(retract, &machine.modal, machine.position, position[2])?
+            }
+        };
+
         record.state = JobState::Running;
         record.acked_lines = index;
         record.last_acked_line = index.checked_sub(1).map(|i| lines[i].number);
@@ -913,18 +977,100 @@ impl Actor {
         record.finished_at_ms = None;
         record.reason = None;
         self.store.save(&record)?;
-        info!(id = %record.id, from = lines[index].number, "job resumed");
+        info!(id = %record.id, from = lines[index].number, retract = options.retract.is_some(), "job resumed");
         self.job = Some(ActiveJob {
             record: record.clone(),
             lines,
             next: index,
-            preamble: machine.modal.preamble().into(),
+            preamble: preamble.into(),
             stop_requested: None,
             resume_pending: false,
             dirty: false,
             last_saved: Instant::now(),
         });
         Ok(record)
+    }
+
+    /// The machine position and G54 offset from the latest status report.
+    fn known_position(&self) -> (Option<[f64; 3]>, Option<[f64; 3]>) {
+        let status = self.machine.status.as_ref();
+        (
+            three(status.and_then(|st| st.machine_position.as_ref())),
+            three(status.and_then(|st| st.work_offset.as_ref())),
+        )
+    }
+
+    /// The lines that lift the tool, move it above `target`, bring the
+    /// spindle back, plunge to `target`, and then restore the program's
+    /// modal state. Everything before the plunge is in machine coordinates
+    /// and millimetres, so the program's own units cannot misplace it.
+    fn retract_lines(
+        &self,
+        retract: &Retract,
+        modal: &Modal,
+        target: [f64; 3],
+        current_z: f64,
+    ) -> Result<Vec<String>, ControlError> {
+        const SLACK: f64 = 1e-6;
+        let invalid = |message: String| Err(ControlError::Invalid(message));
+        if !retract.z.is_finite() {
+            return invalid("retract z must be a number".into());
+        }
+        if retract.z < current_z - SLACK {
+            return invalid(format!(
+                "retract z {} is below the tool's current Z {current_z:.3}; a retract has to go up",
+                retract.z
+            ));
+        }
+        if retract.z < target[2] - SLACK {
+            return invalid(format!(
+                "retract z {} is below the resume point's Z {:.3}; a retract has to go up",
+                retract.z, target[2]
+            ));
+        }
+        if let Some(Bounds {
+            z: Some([low, high]),
+            ..
+        }) = self.store.bounds()?
+            && (retract.z < low - SLACK || retract.z > high + SLACK)
+        {
+            return invalid(format!(
+                "retract z {} is outside the Z boundary {low} to {high}",
+                retract.z
+            ));
+        }
+        if let Some(dwell) = retract.dwell_s
+            && !(0.0..=60.0).contains(&dwell)
+        {
+            return invalid("dwell_s must be between 0 and 60 seconds".into());
+        }
+        let feed = match retract.plunge_feed {
+            Some(f) if f.is_finite() && f > 0.0 => f,
+            Some(_) => return invalid("plunge_feed must be a positive number".into()),
+            None => match modal.feed_mm_per_min() {
+                Some(f) if f > 0.0 => f,
+                _ => {
+                    return invalid(
+                        "the program has no plain feed rate at the resume point; give plunge_feed"
+                            .into(),
+                    );
+                }
+            },
+        };
+
+        let mut lines = vec![
+            "G21 G90 G94".to_string(),
+            format!("G53 G0 Z{:.3}", retract.z),
+            format!("G53 G0 X{:.3} Y{:.3}", target[0], target[1]),
+        ];
+        lines.extend(modal.tool_lines());
+        if let Some(dwell) = retract.dwell_s.filter(|d| *d > 0.0) {
+            lines.push(format!("G4 P{dwell}"));
+        }
+        lines.push(format!("G53 G1 Z{:.3} F{feed:.3}", target[2]));
+        lines.push(modal.state_line());
+        lines.extend(modal.feed_line());
+        Ok(lines)
     }
 
     async fn machine_action(
@@ -1117,4 +1263,8 @@ pub fn state_name(state: JobState) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+fn three(v: Option<&Vec<f64>>) -> Option<[f64; 3]> {
+    v.filter(|v| v.len() >= 3).map(|v| [v[0], v[1], v[2]])
 }

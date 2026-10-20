@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::bounds::Bounds;
-use crate::controller::{ControlError, ControllerHandle, MachineAction};
+use crate::controller::{ControlError, ControllerHandle, MachineAction, ResumeOptions};
 use crate::store::{JobRecord, JobStore};
 
 #[derive(Clone)]
@@ -73,6 +74,20 @@ fn not_found() -> ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// Reads an optional JSON body. Errors are reported in the same JSON shape
+/// as every other error, naming the field that was wrong.
+fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<Option<T>> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice(body).map(Some).map_err(|e| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid body: {e}"),
+        )
+    })
+}
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
@@ -149,8 +164,13 @@ async fn pause_job(
 async fn resume_job(
     State(app): State<AppState>,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> ApiResult<(StatusCode, Json<JobRecord>)> {
-    Ok((StatusCode::ACCEPTED, Json(app.controller.resume(id).await?)))
+    let options = parse_json::<ResumeOptions>(&body)?.unwrap_or_default();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(app.controller.resume(id, options).await?),
+    ))
 }
 
 async fn stop_job(
@@ -184,10 +204,13 @@ async fn get_bounds(State(app): State<AppState>) -> ApiResult<Json<Bounds>> {
     Ok(Json(app.store.bounds()?.unwrap_or_default()))
 }
 
-async fn put_bounds(
-    State(app): State<AppState>,
-    Json(bounds): Json<Bounds>,
-) -> ApiResult<Json<Bounds>> {
+async fn put_bounds(State(app): State<AppState>, body: Bytes) -> ApiResult<Json<Bounds>> {
+    let bounds = parse_json::<Bounds>(&body)?.ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a JSON body is required".into(),
+        )
+    })?;
     bounds
         .validate()
         .map_err(|m| ApiError(StatusCode::UNPROCESSABLE_ENTITY, m))?;

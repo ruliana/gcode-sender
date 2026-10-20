@@ -60,7 +60,7 @@ identified yet.
 | `DELETE /jobs/{id}` | Delete a job that is not active |
 | `POST /jobs/{id}/start` | Start streaming. Also re-runs a finished job from the top |
 | `POST /jobs/{id}/pause` | Feed hold, and stop sending lines |
-| `POST /jobs/{id}/resume` | Cycle start once the hold has settled, and keep sending. Also continues an `interrupted` job, see below |
+| `POST /jobs/{id}/resume` | Cycle start once the hold has settled, and keep sending. Also continues an `interrupted`, `stopped` or `failed` job, with options; see below |
 | `POST /jobs/{id}/stop` | Feed hold, then soft reset once the machine is at rest |
 
 | `POST /machine/unlock` | `$X`: clear an alarm lock |
@@ -111,18 +111,46 @@ A job becomes `interrupted` when the serial connection drops, the
 controller stops answering, the controller resets, or the server stops
 while the job is active. The server keeps reconnecting by itself.
 
-`POST /jobs/{id}/resume` continues an interrupted job once the machine is
-connected, `Idle`, and not in alarm. It does three things:
+`POST /jobs/{id}/resume` continues an `interrupted`, `stopped` or `failed`
+job once the machine is connected, `Idle`, and not in alarm (clear one with
+`POST /machine/unlock`). With no body it does three things:
 
-1. **Backs up.** The saved progress can lag the controller, and a reset
-   throws away whatever was still in its planner, so the job restarts a
-   little before the last acknowledged line: the controller's planner depth
-   plus one line. The job record's `resumed_from_line` says where.
+1. **Backs up.** The saved progress can lag the controller, and a reset or
+   stop throws away whatever was still in its planner, so the job restarts
+   a little before the last acknowledged line: the controller's planner
+   depth plus one line. The job record's `resumed_from_line` says where.
 2. **Restores modal state.** Before the program continues, the server sends
    the units, distance mode, plane, work offset, feed mode, coolant,
    spindle, and feed rate the program had at that point.
-3. **Moves straight to the first line.** There is no retract. Check where
-   the tool is before you resume.
+3. **Moves straight to the next line.** There is no retract by default, so
+   check where the tool is before you resume.
+
+Two options, sent as a JSON body, make it safer:
+
+```sh
+# Lift, travel above the work, bring the spindle back, and plunge.
+curl -X POST localhost:8080/jobs/$id/resume -H 'content-type: application/json' \
+  -d '{"retract": {"z": -5, "dwell_s": 3}}'
+
+# Start from a file line you choose, with no backing up.
+curl -X POST localhost:8080/jobs/$id/resume -H 'content-type: application/json' \
+  -d '{"from_line": 120}'
+```
+
+- `retract.z` is the safe height in machine coordinates, in millimetres.
+  The server sends, in order: a lift to that Z, a rapid to the XY of the
+  resume point, the coolant and spindle the program had, an optional
+  `dwell_s` wait for the spindle (keep it below `--ack-timeout-ms`), a
+  plunge back to the resume point's Z at `plunge_feed` (millimetres per
+  minute; by default the program's own feed rate), and then the rest of the
+  modal state. These moves are in machine coordinates and millimetres, so a
+  program in inches or with another work offset cannot misplace them.
+- A retract has to go up. It is refused with `422` if `z` is below the
+  tool's current Z or below the resume point's Z, which catches a sign
+  mistake, and if it is outside a Z boundary.
+- `from_line` is a file line number. A comment or blank line means the next
+  line of code, and `0` means the top of the program.
+- Neither option applies to a paused job; plain `resume` continues those.
 
 Repeating absolute moves is harmless; repeating incremental ones is not.
 A program in `G91` at the resume point is refused with `422`, as is one
@@ -196,6 +224,6 @@ The tests need Linux or macOS for pseudo-terminals.
 
 - Jogging, probing, and overrides.
 - Reading and changing the controller's `$` settings.
-- Retracting before a resume, and resuming incremental programs.
+- Resuming incremental programs.
 - Testing against a real LongMill. The simulator follows the Grbl 1.1
   documentation and gSender's behaviour, but real hardware has quirks.
