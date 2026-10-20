@@ -53,7 +53,13 @@ async fn reports_machine_status() {
     );
     // Status is polled continuously with the `?` realtime command.
     wait_for("several status queries", || async {
-        (h.sim.realtime_bytes().iter().filter(|&&b| b == b'?').count() > 3).then_some(())
+        (h.sim
+            .realtime_bytes()
+            .iter()
+            .filter(|&&b| b == b'?')
+            .count()
+            > 3)
+        .then_some(())
     })
     .await;
 }

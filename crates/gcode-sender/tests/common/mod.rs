@@ -61,7 +61,14 @@ impl Harness {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_gcode-sender"));
         cmd.arg("--port")
             .arg(self.sim.port())
-            .args(["--listen", "127.0.0.1:0", "--poll-ms", "50", "--reconnect-ms", "200"])
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--poll-ms",
+                "50",
+                "--reconnect-ms",
+                "200",
+            ])
             .arg("--data-dir")
             .arg(&self.data_dir)
             .env("RUST_LOG", "gcode_sender=debug")
@@ -222,7 +229,10 @@ pub fn zigzag(n: usize) -> String {
     let mut g = String::from("; generated test program\n%\nG21 G90\n\n(start)\n");
     for i in 1..=n {
         let y = if i % 2 == 0 { 1.0 } else { 0.0 };
-        g.push_str(&format!("G1 X{:.3} Y{y:.3} F1000 ; move {i}\n", i as f64 * 0.5));
+        g.push_str(&format!(
+            "G1 X{:.3} Y{y:.3} F1000 ; move {i}\n",
+            i as f64 * 0.5
+        ));
     }
     g.push_str("M2\n%\n");
     g

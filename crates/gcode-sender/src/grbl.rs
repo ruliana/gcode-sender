@@ -23,10 +23,16 @@ pub enum Response {
     Error(u32),
     Alarm(u32),
     /// The startup banner, printed after power-on or a soft reset.
-    Banner { kind: FirmwareKind, version: String },
+    Banner {
+        kind: FirmwareKind,
+        version: String,
+    },
     Status(Status),
     /// A bracketed message such as `[VER:...]`, `[OPT:...]` or `[MSG:...]`.
-    Message { tag: String, body: String },
+    Message {
+        tag: String,
+        body: String,
+    },
     Other(String),
 }
 
@@ -85,12 +91,9 @@ pub fn parse(line: &str) -> Response {
 
 fn parse_banner(line: &str) -> Option<Response> {
     let lower = line.to_ascii_lowercase();
-    let (kind, rest) = if let Some(rest) = lower.strip_prefix("grblhal ") {
-        (FirmwareKind::Grblhal, rest)
-    } else if let Some(rest) = lower.strip_prefix("grbl ") {
-        (FirmwareKind::Grbl, rest)
-    } else {
-        return None;
+    let (kind, rest) = match lower.strip_prefix("grblhal ") {
+        Some(rest) => (FirmwareKind::Grblhal, rest),
+        None => (FirmwareKind::Grbl, lower.strip_prefix("grbl ")?),
     };
     let version = rest.split_whitespace().next()?.to_string();
     Some(Response::Banner { kind, version })

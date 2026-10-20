@@ -111,7 +111,10 @@ async fn create_job(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-async fn get_job(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<JobRecord>> {
+async fn get_job(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<JobRecord>> {
     let record = app.store.get(&id)?.ok_or_else(not_found)?;
     Ok(Json(freshest(&app, record)))
 }

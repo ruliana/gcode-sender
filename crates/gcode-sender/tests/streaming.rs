@@ -55,7 +55,9 @@ async fn upload_can_be_named() {
 #[tokio::test]
 async fn rejects_program_with_nothing_to_send() {
     let h = Harness::start(SimConfig::grbl()).await;
-    let (status, body) = h.post_body("/jobs", "; only a comment\n\n(and this)\n%\n").await;
+    let (status, body) = h
+        .post_body("/jobs", "; only a comment\n\n(and this)\n%\n")
+        .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body["error"].as_str().unwrap().contains("no lines"));
 }
@@ -64,8 +66,14 @@ async fn rejects_program_with_nothing_to_send() {
 async fn unknown_job_is_not_found() {
     let h = Harness::start(SimConfig::grbl()).await;
     let missing = "00000000-0000-4000-8000-000000000000";
-    assert_eq!(h.get(&format!("/jobs/{missing}")).await.0, StatusCode::NOT_FOUND);
-    assert_eq!(h.post(&format!("/jobs/{missing}/start")).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.get(&format!("/jobs/{missing}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.post(&format!("/jobs/{missing}/start")).await.0,
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(h.get("/jobs/not-a-uuid").await.0, StatusCode::NOT_FOUND);
 }
 
@@ -104,7 +112,10 @@ async fn character_counting_fills_but_never_overflows_buffer() {
     assert!(!h.sim.overflowed(), "RX buffer overflowed");
     // Streaming ahead of the planner is the point of character counting.
     let used = h.sim.max_rx_used();
-    assert!(used > 64, "only {used} bytes of the RX buffer were ever used");
+    assert!(
+        used > 64,
+        "only {used} bytes of the RX buffer were ever used"
+    );
     assert!(used <= 128 - 8, "the reserve was not respected: {used}");
 }
 
@@ -171,9 +182,15 @@ async fn completed_job_can_run_again() {
 async fn deletes_finished_job_but_not_active_one() {
     let h = Harness::start(SimConfig::grbl().block_duration(Duration::from_millis(5))).await;
     let id = h.run(&zigzag(200)).await;
-    assert_eq!(h.delete(&format!("/jobs/{id}")).await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        h.delete(&format!("/jobs/{id}")).await.0,
+        StatusCode::CONFLICT
+    );
     h.wait_job_state(&id, "completed").await;
-    assert_eq!(h.delete(&format!("/jobs/{id}")).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.delete(&format!("/jobs/{id}")).await.0,
+        StatusCode::NO_CONTENT
+    );
     assert_eq!(h.get(&format!("/jobs/{id}")).await.0, StatusCode::NOT_FOUND);
 }
 
@@ -194,8 +211,10 @@ async fn refuses_to_start_while_controller_is_in_alarm() {
 async fn alarm_during_job_fails_it() {
     let h = Harness::start(SimConfig::grbl().block_duration(Duration::from_millis(10))).await;
     let id = h.run(&zigzag(300)).await;
-    h.wait_job(&id, "some progress", |j| j["acked_lines"].as_u64() > Some(10))
-        .await;
+    h.wait_job(&id, "some progress", |j| {
+        j["acked_lines"].as_u64() > Some(10)
+    })
+    .await;
     h.sim.trigger_alarm(1);
     let job = h.wait_job_state(&id, "failed").await;
     assert!(job["reason"].as_str().unwrap().contains("alarm 1"));
@@ -217,7 +236,8 @@ async fn rejected_line_pauses_job_with_its_line_number() {
     assert_eq!(errors[0]["line"], 15);
     assert_eq!(errors[0]["text"], "G1 X5.000 Y1.000 F1000");
     assert!(job["reason"].as_str().unwrap().contains("line 15"));
-    h.wait_machine("the hold", |m| m["status"]["state"] == "Hold").await;
+    h.wait_machine("the hold", |m| m["status"]["state"] == "Hold")
+        .await;
 
     // The operator can decide to carry on.
     h.action(&id, "resume").await;

@@ -78,8 +78,7 @@ pub struct JobStore {
 impl JobStore {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let root = data_dir.join("jobs");
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("creating {}", root.display()))?;
+        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
         Ok(Self { root })
     }
 

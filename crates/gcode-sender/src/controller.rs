@@ -243,7 +243,7 @@ struct Actor {
 const DEFAULT_RX_BUFFER: usize = 128;
 const INFO_RETRY: Duration = Duration::from_secs(1);
 const RESET_TIMEOUT: Duration = Duration::from_secs(3);
-const SAVE_INTERVAL: Duration = Duration::from_millis(500);
+const SAVE_INTERVAL: Duration = Duration::from_millis(250);
 
 impl Actor {
     async fn run(mut self) {
@@ -316,7 +316,9 @@ impl Actor {
 
     fn delete(&mut self, id: &str) -> Result<(), ControlError> {
         if self.job.as_ref().is_some_and(|j| j.record.id == id) {
-            return Err(ControlError::Conflict("job is active; stop it first".into()));
+            return Err(ControlError::Conflict(
+                "job is active; stop it first".into(),
+            ));
         }
         if self.store.delete(id)? {
             Ok(())
@@ -412,7 +414,11 @@ impl Actor {
             Response::Alarm(code) => {
                 warn!(code, "alarm");
                 self.machine.alarm = Some(code);
-                if self.job.as_ref().is_some_and(|j| j.stop_requested.is_none()) {
+                if self
+                    .job
+                    .as_ref()
+                    .is_some_and(|j| j.stop_requested.is_none())
+                {
                     self.finish_job(JobState::Failed, Some(format!("controller alarm {code}")));
                 }
             }
@@ -493,9 +499,7 @@ impl Actor {
             if s.awaiting_reset.is_none() && (status.hold_complete() || status.state == "Idle") {
                 self.soft_reset(s).await?;
             }
-        } else if job.record.state == JobState::Running
-            && job.all_acked()
-            && status.state == "Idle"
+        } else if job.record.state == JobState::Running && job.all_acked() && status.state == "Idle"
         {
             // Every line is in the planner and the machine has come to rest.
             self.finish_job(JobState::Completed, None);
@@ -546,8 +550,10 @@ impl Actor {
                             // rest of the program is still safe to run.
                             s.writer.write_all(&[realtime::FEED_HOLD]).await?;
                             job.record.state = JobState::Paused;
-                            job.record.reason =
-                                Some(format!("line {} was rejected with error {code}", line.number));
+                            job.record.reason = Some(format!(
+                                "line {} was rejected with error {code}",
+                                line.number
+                            ));
                             self.save_progress(true);
                         }
                     }
@@ -641,7 +647,9 @@ impl Actor {
         }
         let lines = self.store.program(id)?;
         if lines.is_empty() {
-            return Err(ControlError::Invalid("the program has no lines to send".into()));
+            return Err(ControlError::Invalid(
+                "the program has no lines to send".into(),
+            ));
         }
         let capacity = self.capacity(s);
         if let Some(long) = lines.iter().find(|l| l.text.len() + 1 > capacity) {
@@ -689,7 +697,10 @@ impl Actor {
     }
 
     fn active_record(&self) -> JobRecord {
-        self.job.as_ref().map(|j| j.record.clone()).expect("active job")
+        self.job
+            .as_ref()
+            .map(|j| j.record.clone())
+            .expect("active job")
     }
 
     fn capacity(&self, s: &Session) -> usize {
@@ -729,7 +740,12 @@ impl Actor {
         Ok(())
     }
 
-    async fn send_line(&mut self, s: &mut Session, text: &str, origin: Origin) -> std::io::Result<()> {
+    async fn send_line(
+        &mut self,
+        s: &mut Session,
+        text: &str,
+        origin: Origin,
+    ) -> std::io::Result<()> {
         let bytes = text.len() + 1;
         s.writer.write_all(format!("{text}\n").as_bytes()).await?;
         s.inflight.push_back(InFlight { origin, bytes });
@@ -749,7 +765,11 @@ impl Actor {
         s.inflight.clear();
         s.inflight_bytes = 0;
         s.info.next_at = None;
-        if self.job.as_ref().is_some_and(|j| j.stop_requested.is_some()) {
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|j| j.stop_requested.is_some())
+        {
             self.finish_job(JobState::Stopped, Some("stopped on request".into()));
         }
     }
