@@ -1,4 +1,6 @@
+mod bounds;
 mod controller;
+mod gcode;
 mod grbl;
 mod http;
 mod program;
@@ -43,6 +45,17 @@ struct Args {
     /// Delay between attempts to open the serial port, in milliseconds.
     #[arg(long, default_value_t = 1000)]
     reconnect_ms: u64,
+
+    /// Treat the connection as dead after this long without hearing from
+    /// the controller, in milliseconds.
+    #[arg(long, default_value_t = 3000)]
+    silence_timeout_ms: u64,
+
+    /// Treat an acknowledgement as lost when lines stay unacknowledged for
+    /// this long while the machine is idle, in milliseconds. Keep it above
+    /// the longest dwell (G4) in your programs.
+    #[arg(long, default_value_t = 30_000)]
+    ack_timeout_ms: u64,
 }
 
 #[tokio::main]
@@ -69,6 +82,8 @@ async fn main() -> anyhow::Result<()> {
             poll_interval: Duration::from_millis(args.poll_ms),
             reconnect_interval: Duration::from_millis(args.reconnect_ms),
             stop_timeout: Duration::from_secs(5),
+            silence_timeout: Duration::from_millis(args.silence_timeout_ms),
+            ack_timeout: Duration::from_millis(args.ack_timeout_ms),
         },
         store.clone(),
     );

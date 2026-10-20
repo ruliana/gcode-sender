@@ -11,7 +11,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::controller::{ControlError, ControllerHandle};
+use crate::bounds::Bounds;
+use crate::controller::{ControlError, ControllerHandle, MachineAction};
 use crate::store::{JobRecord, JobStore};
 
 #[derive(Clone)]
@@ -24,6 +25,13 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/machine", get(machine))
+        .route("/machine/unlock", post(unlock))
+        .route("/machine/home", post(home))
+        .route("/machine/reset", post(reset))
+        .route(
+            "/machine/bounds",
+            get(get_bounds).put(put_bounds).delete(delete_bounds),
+        )
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(delete_job))
         .route("/jobs/{id}/start", post(start_job))
@@ -150,4 +158,44 @@ async fn stop_job(
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<JobRecord>)> {
     Ok((StatusCode::ACCEPTED, Json(app.controller.stop(id).await?)))
+}
+
+async fn machine_action(
+    app: AppState,
+    action: MachineAction,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    app.controller.machine(action).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))))
+}
+
+async fn unlock(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    machine_action(app, MachineAction::Unlock).await
+}
+
+async fn home(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    machine_action(app, MachineAction::Home).await
+}
+
+async fn reset(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    machine_action(app, MachineAction::Reset).await
+}
+
+async fn get_bounds(State(app): State<AppState>) -> ApiResult<Json<Bounds>> {
+    Ok(Json(app.store.bounds()?.unwrap_or_default()))
+}
+
+async fn put_bounds(
+    State(app): State<AppState>,
+    Json(bounds): Json<Bounds>,
+) -> ApiResult<Json<Bounds>> {
+    bounds
+        .validate()
+        .map_err(|m| ApiError(StatusCode::UNPROCESSABLE_ENTITY, m))?;
+    app.store.set_bounds(Some(&bounds))?;
+    Ok(Json(bounds))
+}
+
+async fn delete_bounds(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.store.set_bounds(None)?;
+    Ok(StatusCode::NO_CONTENT)
 }

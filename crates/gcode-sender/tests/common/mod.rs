@@ -68,6 +68,10 @@ impl Harness {
                 "50",
                 "--reconnect-ms",
                 "200",
+                "--silence-timeout-ms",
+                "1500",
+                "--ack-timeout-ms",
+                "1000",
             ])
             .arg("--data-dir")
             .arg(&self.data_dir)
@@ -118,6 +122,17 @@ impl Harness {
             .post(self.url(path))
             .header("content-type", "text/plain")
             .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        decode(res).await
+    }
+
+    pub async fn put_json(&self, path: &str, body: &Value) -> (StatusCode, Value) {
+        let res = self
+            .client
+            .put(self.url(path))
+            .json(body)
             .send()
             .await
             .unwrap();
@@ -186,6 +201,24 @@ impl Harness {
             .await
     }
 
+    pub async fn wait_idle(&self) -> Value {
+        self.wait_machine("the machine to be idle", |m| {
+            m["ready"] == true && m["status"]["state"] == "Idle"
+        })
+        .await
+    }
+
+    /// Waits for the server to notice the link is gone. A real serial port
+    /// clears its exclusive lock when the server closes it; the simulator's
+    /// pseudo-terminal needs to be told.
+    pub async fn wait_disconnected(&self) -> Value {
+        let m = self
+            .wait_machine("the connection to drop", |m| m["connection"] != "connected")
+            .await;
+        self.sim.release_port();
+        m
+    }
+
     /// Uploads and starts a program, returning the job id.
     pub async fn run(&self, gcode: &str) -> String {
         let id = self.upload(gcode).await["id"].as_str().unwrap().to_string();
@@ -237,4 +270,29 @@ pub fn zigzag(n: usize) -> String {
     }
     g.push_str("M2\n%\n");
     g
+}
+
+/// The lines a correct sender delivers for `zigzag(n)`: comments, blank
+/// lines and `%` are gone.
+pub fn zigzag_lines(n: usize) -> Vec<String> {
+    let mut lines = vec!["G21 G90".to_string()];
+    for i in 1..=n {
+        let y = if i % 2 == 0 { 1.0 } else { 0.0 };
+        lines.push(format!("G1 X{:.3} Y{y:.3} F1000", i as f64 * 0.5));
+    }
+    lines.push("M2".into());
+    lines
+}
+
+/// File line number of the prepared line at `index` in `zigzag(n)`.
+pub fn zigzag_file_line(index: usize) -> usize {
+    if index == 0 { 3 } else { 5 + index }
+}
+
+/// Lines the controller was sent that are part of a program, not queries.
+pub fn program_lines(sim: &Simulator) -> Vec<String> {
+    sim.received_lines()
+        .into_iter()
+        .filter(|l| !l.starts_with('$'))
+        .collect()
 }
