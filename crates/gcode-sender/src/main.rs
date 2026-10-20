@@ -1,0 +1,91 @@
+mod controller;
+mod grbl;
+mod http;
+mod program;
+mod store;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use clap::Parser;
+use tracing::{info, warn};
+
+/// A G-code sender for GRBL-family CNC controllers, driven over HTTP.
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Args {
+    /// Serial port of the controller, such as /dev/ttyACM0.
+    #[arg(long, env = "GCODE_SENDER_PORT")]
+    port: String,
+
+    /// Serial baud rate. LongMill controllers use 115200.
+    #[arg(long, env = "GCODE_SENDER_BAUD", default_value_t = 115_200)]
+    baud: u32,
+
+    /// Address for the HTTP API. Use port 0 to pick a free port.
+    #[arg(long, env = "GCODE_SENDER_LISTEN", default_value = "127.0.0.1:8080")]
+    listen: String,
+
+    /// Where jobs are stored. Everything needed after a restart lives here.
+    #[arg(long, env = "GCODE_SENDER_DATA_DIR", default_value = "./data")]
+    data_dir: PathBuf,
+
+    /// Bytes of the controller's RX buffer to leave unused.
+    #[arg(long, default_value_t = 8)]
+    rx_reserve: usize,
+
+    /// Status report interval in milliseconds.
+    #[arg(long, default_value_t = 200)]
+    poll_ms: u64,
+
+    /// Delay between attempts to open the serial port, in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    reconnect_ms: u64,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "gcode_sender=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let args = Args::parse();
+
+    let store = Arc::new(store::JobStore::open(&args.data_dir)?);
+    for job in store.recover()? {
+        warn!(id = %job.id, "job was active when the server last stopped; marked interrupted");
+    }
+
+    let controller = controller::spawn(
+        controller::Config {
+            port: args.port,
+            baud: args.baud,
+            rx_reserve: args.rx_reserve,
+            poll_interval: Duration::from_millis(args.poll_ms),
+            reconnect_interval: Duration::from_millis(args.reconnect_ms),
+            stop_timeout: Duration::from_secs(5),
+        },
+        store.clone(),
+    );
+
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("binding {}", args.listen))?;
+    let addr = listener.local_addr()?;
+    info!(%addr, "HTTP API listening");
+    // Printed on stdout so scripts and tests can find the port.
+    println!("listening on {addr}");
+
+    let app = http::router(http::AppState { store, controller });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
