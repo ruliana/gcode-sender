@@ -196,6 +196,9 @@ struct ActiveJob {
     lines: Vec<ProgramLine>,
     next: usize,
     stop_requested: Option<Instant>,
+    /// A resume was requested; cycle start is sent once the hold has
+    /// settled, because the controller ignores it while decelerating.
+    resume_pending: bool,
     dirty: bool,
     last_saved: Instant,
 }
@@ -476,9 +479,16 @@ impl Actor {
     }
 
     async fn on_status(&mut self, s: &mut Session, status: &Status) -> std::io::Result<()> {
-        let Some(job) = &self.job else {
+        let Some(job) = &mut self.job else {
             return Ok(());
         };
+        if job.resume_pending {
+            if status.hold_complete() {
+                s.writer.write_all(&[realtime::CYCLE_START]).await?;
+            } else if status.state != "Hold" {
+                job.resume_pending = false;
+            }
+        }
         if job.stop_requested.is_some() {
             if s.awaiting_reset.is_none() && (status.hold_complete() || status.state == "Idle") {
                 self.soft_reset(s).await?;
@@ -561,6 +571,9 @@ impl Actor {
                 let result = self.check_active(&id, &[JobState::Running]);
                 if result.is_ok() {
                     s.writer.write_all(&[realtime::FEED_HOLD]).await?;
+                    if let Some(job) = &mut self.job {
+                        job.resume_pending = false;
+                    }
                     self.transition(JobState::Paused, Some("paused on request".into()));
                 }
                 let _ = reply.send(result.map(|_| self.active_record()));
@@ -568,7 +581,9 @@ impl Actor {
             Command::Resume(id, reply) => {
                 let result = self.check_active(&id, &[JobState::Paused]);
                 if result.is_ok() {
-                    s.writer.write_all(&[realtime::CYCLE_START]).await?;
+                    if let Some(job) = &mut self.job {
+                        job.resume_pending = true;
+                    }
                     self.transition(JobState::Running, None);
                 }
                 let _ = reply.send(result.map(|_| self.active_record()));
@@ -577,6 +592,9 @@ impl Actor {
             Command::Stop(id, reply) => {
                 let result = self.check_active(&id, &[JobState::Running, JobState::Paused]);
                 if result.is_ok() {
+                    if let Some(job) = &mut self.job {
+                        job.resume_pending = false;
+                    }
                     // Hold first so the machine decelerates instead of
                     // losing position; the reset follows on Hold:0.
                     s.writer.write_all(&[realtime::FEED_HOLD]).await?;
@@ -647,6 +665,7 @@ impl Actor {
             lines,
             next: 0,
             stop_requested: None,
+            resume_pending: false,
             dirty: false,
             last_saved: Instant::now(),
         });
