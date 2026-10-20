@@ -37,6 +37,8 @@ cargo run --release -p gcode-sender -- --port /dev/ttyACM0 --data-dir ./data
 | `--rx-reserve` | `8` | Bytes of the RX buffer left unused as a margin |
 | `--poll-ms` | `200` | Status report interval |
 | `--reconnect-ms` | `1000` | Delay between attempts to open the port |
+| `--silence-timeout-ms` | `3000` | Treat the link as dead after this long without hearing from the controller |
+| `--ack-timeout-ms` | `30000` | Treat an acknowledgement as lost after lines stay unacknowledged this long while the machine is idle. Keep it above your longest dwell (`G4`) |
 
 Each option can also be set with an environment variable such as
 `GCODE_SENDER_PORT`. Logging is controlled with `RUST_LOG`.
@@ -58,14 +60,26 @@ identified yet.
 | `DELETE /jobs/{id}` | Delete a job that is not active |
 | `POST /jobs/{id}/start` | Start streaming. Also re-runs a finished job from the top |
 | `POST /jobs/{id}/pause` | Feed hold, and stop sending lines |
-| `POST /jobs/{id}/resume` | Cycle start once the hold has settled, and keep sending |
+| `POST /jobs/{id}/resume` | Cycle start once the hold has settled, and keep sending. Also continues an `interrupted` job, see below |
 | `POST /jobs/{id}/stop` | Feed hold, then soft reset once the machine is at rest |
+
+| `POST /machine/unlock` | `$X`: clear an alarm lock |
+| `POST /machine/home` | `$H`: run the homing cycle |
+| `POST /machine/reset` | Soft reset, for example to clear a hold left by an earlier session |
+| `GET /machine/bounds` | The machine boundaries, see below |
+| `PUT /machine/bounds` | Set the boundaries |
+| `DELETE /machine/bounds` | Remove the boundaries |
+
+The three `/machine` actions are refused while a job is active; stop the job
+first.
 
 Only one job is active at a time. A job's `state` is one of `loaded`,
 `running`, `paused`, `stopping`, `completed`, `stopped`, `failed`, or
 `interrupted`. Records also carry `total_lines`, `acked_lines`,
 `last_acked_line` (a line number in the uploaded file), `line_errors`, and
-a `reason` for pauses and failures.
+a `reason` for pauses and failures. A rejected line is recorded with its
+error code and what the code means, and alarms are explained in `reason`
+and in `GET /machine`.
 
 ```sh
 id=$(curl -s --data-binary @part.nc 'localhost:8080/jobs?name=part.nc' | jq -r .id)
@@ -82,14 +96,82 @@ curl -s localhost:8080/jobs/$id | jq '{state, acked_lines, total_lines}'
   machine reports `Idle`, not when the last `ok` arrives.
 - **Errors and alarms.** A line answered with `error:N` holds the machine
   and pauses the job, recording the file line number, so an operator can
-  decide whether to resume or stop. An alarm fails the job.
+  decide whether to resume or stop. An alarm fails the job; clear it with
+  `POST /machine/unlock` or `POST /machine/home`.
 - **Stopping.** The server sends a feed hold, waits for `Hold:0` (or
   `Idle`), and only then sends a soft reset, so the machine decelerates
   and keeps its position instead of raising `ALARM:3`.
 - **State on disk.** Jobs live under `--data-dir` as the uploaded program
   plus a JSON record written with an atomic rename. Progress is saved
-  every 250 ms while running. If the server stops while a job is active,
-  the next server marks that job `interrupted` with its saved progress.
+  every 250 ms while running.
+
+### Interrupted jobs and resuming
+
+A job becomes `interrupted` when the serial connection drops, the
+controller stops answering, the controller resets, or the server stops
+while the job is active. The server keeps reconnecting by itself.
+
+`POST /jobs/{id}/resume` continues an interrupted job once the machine is
+connected, `Idle`, and not in alarm. It does three things:
+
+1. **Backs up.** The saved progress can lag the controller, and a reset
+   throws away whatever was still in its planner, so the job restarts a
+   little before the last acknowledged line: the controller's planner depth
+   plus one line. The job record's `resumed_from_line` says where.
+2. **Restores modal state.** Before the program continues, the server sends
+   the units, distance mode, plane, work offset, feed mode, coolant,
+   spindle, and feed rate the program had at that point.
+3. **Moves straight to the first line.** There is no retract. Check where
+   the tool is before you resume.
+
+Repeating absolute moves is harmless; repeating incremental ones is not.
+A program in `G91` at the resume point is refused with `422`, as is one
+that uses `G92`, `G10`, `G28`, `G30`, or a work offset other than `G54`
+before that point, because the server cannot rebuild that state. Those
+jobs can still be started again from the top.
+
+If the controller resets while moving (an Arduino based LongBoard does when
+the USB port reopens), it raises `ALARM:3` and may have lost its position.
+The server will not resume until you have dealt with the alarm.
+
+### Watching the connection
+
+- A status query goes out every `--poll-ms`. The controller answers even
+  in the middle of a move, so total silence for `--silence-timeout-ms`
+  means the link is dead. The server drops the connection and reconnects.
+- If lines stay unacknowledged for `--ack-timeout-ms` while the machine is
+  `Idle`, an acknowledgement was lost and nobody knows what the controller
+  has received. The job fails and the controller is reset so nothing
+  unknown is left in it.
+- Line noise and unrecognised output are ignored. Acknowledgements left
+  over from an earlier session are discarded while the controller is
+  identified, so they cannot be mistaken for the new session's replies.
+
+### Boundaries
+
+`PUT /machine/bounds` takes ranges in machine coordinates, in millimetres.
+Leave an axis out to leave it unchecked.
+
+```sh
+curl -X PUT localhost:8080/machine/bounds -H 'content-type: application/json' \
+  -d '{"x": [0, 800], "y": [0, 400], "z": [-60, 0]}'
+```
+
+When boundaries are set, a job is checked before any of it is sent, on
+start and on resume. The whole program is followed from the machine's
+current position, using the work offset the controller reports. Units,
+absolute and incremental moves, `G53`, and arcs (including their bulge
+between the end points, in the center and radius forms) are understood. A
+move outside the boundaries is refused with `422` naming the line, the
+axis and the value, and nothing reaches the controller. A program the
+server cannot follow (`G92`, `G10`, `G28`, `G30`, other work offsets,
+parameters, expressions) is refused too, because it could move anywhere.
+These checks apply only while boundaries are set.
+
+This complements the controller's own soft limits rather than replacing
+them: it catches a bad program before it starts, but it knows nothing
+about a tool length offset or a probe cycle that moves further than
+planned.
 
 ## Testing
 
@@ -98,7 +180,10 @@ controller (`crates/grbl-sim`) on a pseudo-terminal and a real
 `gcode-sender` process pointed at it, then drives the server over HTTP and
 checks what the controller received. The simulator models the RX buffer,
 planner queue, realtime commands, feed hold deceleration, soft reset,
-alarms, and injected `error:N` replies, and flags any RX buffer overflow.
+alarms, and the work offset. It can also unplug and replug the cable (with
+or without the reset an Arduino board performs), go silent, lose
+acknowledgements, inject line noise and `error:N` replies, and it flags any
+RX buffer overflow.
 
 ```sh
 cargo test
@@ -109,8 +194,8 @@ The tests need Linux or macOS for pseudo-terminals.
 
 ## Not done yet
 
-- Resuming an interrupted job from where it stopped, after a dropped
-  connection or a server restart. This needs modal state (units, distance
-  mode, work offset, spindle) rebuilt before the resume line.
-- Optional X/Y/Z boundaries checked before lines are sent.
-- Unlocking (`$X`) and homing (`$H`) endpoints, and jogging.
+- Jogging, probing, and overrides.
+- Reading and changing the controller's `$` settings.
+- Retracting before a resume, and resuming incremental programs.
+- Testing against a real LongMill. The simulator follows the Grbl 1.1
+  documentation and gSender's behaviour, but real hardware has quirks.

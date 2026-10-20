@@ -138,3 +138,61 @@ fn parse_status(body: &str) -> Status {
 pub fn rx_buffer_from_opt(body: &str) -> Option<usize> {
     body.split(',').nth(2)?.trim().parse().ok()
 }
+
+/// What an `error:N` reply means, from the Grbl 1.1 documentation.
+pub fn error_message(code: u32) -> &'static str {
+    match code {
+        1 => "expected a command letter",
+        2 => "bad number format",
+        3 => "invalid $ statement",
+        4 => "negative value for an expected positive value",
+        5 => "setting is disabled",
+        8 => "not allowed unless the machine is idle",
+        9 => "G-code is locked out during an alarm or jog",
+        10 => "homing is not enabled",
+        11 => "line overflow",
+        14 => "line length exceeded",
+        15 => "jog target exceeds machine travel",
+        16 => "invalid jog command",
+        20 => "unsupported or invalid G-code command",
+        21 => "more than one command from the same modal group",
+        22 => "feed rate has not been set",
+        23 => "a command requires an integer value",
+        24 => "two commands both need axis words",
+        25 => "a G-code word was repeated",
+        26 => "a command requires axis words",
+        27 => "line number is invalid",
+        28 => "a P or L value is missing",
+        29 => "G59.x work coordinate systems are not supported",
+        30 => "G53 is only valid with G0 and G1",
+        31 => "axis words exist but no command uses them",
+        32 => "arc needs at least one in-plane axis word",
+        33 => "motion target is invalid",
+        34 => "arc radius is invalid",
+        35 => "arc needs at least one in-plane offset word",
+        36 => "unused value words in the block",
+        _ => "unknown error",
+    }
+}
+
+/// What an `ALARM:N` means, from the Grbl 1.1 documentation.
+pub fn alarm_message(code: u32) -> &'static str {
+    match code {
+        1 => "hard limit triggered; position may be lost",
+        2 => "the motion target exceeds the machine's soft limits",
+        3 => "reset while in motion; position may be lost",
+        4 => "probe failed: not in the expected starting state",
+        5 => "probe failed: no contact",
+        6 => "homing failed: reset during the cycle",
+        7 => "homing failed: door opened",
+        8 => "homing failed: could not clear the limit switch",
+        9 => "homing failed: could not find the limit switch",
+        _ => "unknown alarm",
+    }
+}
+
+/// Reads the planner block count from an `[OPT:...]` body. It is the second
+/// field on both Grbl 1.1 and grblHAL.
+pub fn planner_blocks_from_opt(body: &str) -> Option<usize> {
+    body.split(',').nth(1)?.trim().parse().ok()
+}

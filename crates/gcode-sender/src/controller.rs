@@ -20,6 +20,8 @@ use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_util::codec::{Decoder, FramedRead};
 use tracing::{debug, info, warn};
 
+use crate::bounds;
+use crate::gcode::Interpreter;
 use crate::grbl::{self, FirmwareKind, Response, Status, realtime};
 use crate::program::ProgramLine;
 use crate::store::{JobRecord, JobState, JobStore, LineError, now_ms};
@@ -34,6 +36,12 @@ pub struct Config {
     pub reconnect_interval: Duration,
     /// How long to wait for a feed hold to settle before resetting on stop.
     pub stop_timeout: Duration,
+    /// How long the controller may say nothing, not even answer a status
+    /// query, before the connection is treated as dead.
+    pub silence_timeout: Duration,
+    /// How long lines may sit unacknowledged while the machine is idle
+    /// before the acknowledgement is considered lost.
+    pub ack_timeout: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -61,6 +69,7 @@ pub struct MachineSnapshot {
     pub rx_buffer_size: Option<usize>,
     pub status: Option<Status>,
     pub alarm: Option<u32>,
+    pub alarm_message: Option<String>,
     pub last_error: Option<String>,
     /// The freshest record of the active job, if any.
     pub active_job: Option<JobRecord>,
@@ -89,6 +98,18 @@ enum Command {
     Resume(String, Reply<JobRecord>),
     Stop(String, Reply<JobRecord>),
     Delete(String, Reply<()>),
+    Machine(MachineAction, Reply<()>),
+}
+
+/// Things an operator can ask of the machine outside a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineAction {
+    /// `$X`: clear an alarm lock without homing.
+    Unlock,
+    /// `$H`: run the homing cycle.
+    Home,
+    /// Soft reset, which also clears a feed hold left by an earlier session.
+    Reset,
 }
 
 #[derive(Clone)]
@@ -127,6 +148,9 @@ impl ControllerHandle {
     pub async fn delete(&self, id: String) -> Result<(), ControlError> {
         self.call(|r| Command::Delete(id, r)).await
     }
+    pub async fn machine(&self, action: MachineAction) -> Result<(), ControlError> {
+        self.call(|r| Command::Machine(action, r)).await
+    }
 }
 
 pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
@@ -139,6 +163,7 @@ pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
         rx_buffer_size: None,
         status: None,
         alarm: None,
+        alarm_message: None,
         last_error: None,
         active_job: None,
     };
@@ -184,6 +209,10 @@ enum Origin {
     Job(usize),
     /// The `$I` build info query used to identify the firmware.
     Info,
+    /// A line that restores modal state before a resumed job continues.
+    Preamble,
+    /// An operator command such as `$X`.
+    Internal,
 }
 
 struct InFlight {
@@ -195,6 +224,8 @@ struct ActiveJob {
     record: JobRecord,
     lines: Vec<ProgramLine>,
     next: usize,
+    /// Lines that rebuild modal state before `next`, sent first on resume.
+    preamble: VecDeque<String>,
     stop_requested: Option<Instant>,
     /// A resume was requested; cycle start is sent once the hold has
     /// settled, because the controller ignores it while decelerating.
@@ -216,6 +247,12 @@ struct Session {
     inflight_bytes: usize,
     rx_buffer: usize,
     info: InfoProbe,
+    planner_blocks: usize,
+    /// When anything last arrived from the controller.
+    last_rx: Instant,
+    /// When the controller last acknowledged a line, or when the first line
+    /// of the current batch went out.
+    last_ack: Instant,
     /// Set after a soft reset is sent; acknowledgements are meaningless
     /// until the controller prints its banner again.
     awaiting_reset: Option<Instant>,
@@ -228,6 +265,12 @@ struct InfoProbe {
     kind: Option<FirmwareKind>,
     version: Option<String>,
     rx_buffer: Option<usize>,
+    planner_blocks: Option<usize>,
+    /// The build info reply has started. The controller may still be
+    /// answering lines an earlier session left in its buffer, and those
+    /// acknowledgements arrive first; only an `ok` that follows the `[OPT:`
+    /// line belongs to the probe.
+    saw_opt: bool,
 }
 
 struct Actor {
@@ -241,6 +284,8 @@ struct Actor {
 
 /// Grbl 1.1 ships with a 128 byte RX buffer, the smallest in the family.
 const DEFAULT_RX_BUFFER: usize = 128;
+/// Grbl 1.1 plans 15 blocks (16 slots), the smallest in the family.
+const DEFAULT_PLANNER_BLOCKS: usize = 16;
 const INFO_RETRY: Duration = Duration::from_secs(1);
 const RESET_TIMEOUT: Duration = Duration::from_secs(3);
 const SAVE_INTERVAL: Duration = Duration::from_millis(250);
@@ -280,10 +325,12 @@ impl Actor {
         self.machine.ready = false;
         self.machine.status = None;
         if self.job.is_some() {
-            self.finish_job(
-                JobState::Interrupted,
-                Some("the serial connection was lost".into()),
-            );
+            let reason = self
+                .machine
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "the serial connection was lost".into());
+            self.finish_job(JobState::Interrupted, Some(reason));
         }
         self.publish();
     }
@@ -295,13 +342,28 @@ impl Actor {
                     "the machine is not connected".into(),
                 )));
             }
+            Command::Resume(id, r) if self.is_interrupted(&id) => {
+                let _ = r.send(Err(ControlError::Unavailable(
+                    "the machine is not connected".into(),
+                )));
+            }
             Command::Pause(id, r) | Command::Resume(id, r) | Command::Stop(id, r) => {
                 let _ = r.send(self.inactive_error(&id));
             }
             Command::Delete(id, r) => {
                 let _ = r.send(self.delete(&id));
             }
+            Command::Machine(_, r) => {
+                let _ = r.send(Err(ControlError::Unavailable(
+                    "the machine is not connected".into(),
+                )));
+            }
         }
+    }
+
+    fn is_interrupted(&self, id: &str) -> bool {
+        self.job.is_none()
+            && matches!(self.store.get(id), Ok(Some(j)) if j.state == JobState::Interrupted)
     }
 
     fn inactive_error(&self, id: &str) -> Result<JobRecord, ControlError> {
@@ -336,6 +398,9 @@ impl Actor {
             inflight_bytes: 0,
             rx_buffer: DEFAULT_RX_BUFFER,
             info: InfoProbe::default(),
+            planner_blocks: DEFAULT_PLANNER_BLOCKS,
+            last_rx: Instant::now(),
+            last_ack: Instant::now(),
             awaiting_reset: None,
         };
         self.machine.connection = Connection::Connected;
@@ -347,7 +412,10 @@ impl Actor {
         loop {
             let result = tokio::select! {
                 line = lines.next() => match line {
-                    Some(Ok(line)) => self.on_line(&mut s, &line).await,
+                    Some(Ok(line)) => {
+                        s.last_rx = Instant::now();
+                        self.on_line(&mut s, &line).await
+                    }
                     Some(Err(e)) => Err(e),
                     None => Err(std::io::ErrorKind::UnexpectedEof.into()),
                 },
@@ -371,6 +439,43 @@ impl Actor {
         s.writer.write_all(&[realtime::STATUS]).await?;
         let now = Instant::now();
 
+        // The controller answers a status query even in the middle of a
+        // move, so total silence means the link is dead, not busy.
+        if s.last_rx.elapsed() > self.config.silence_timeout {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the controller stopped responding",
+            ));
+        }
+
+        // Lines normally stay unacknowledged only while the planner is full,
+        // and then the machine is moving. Idle with lines outstanding means
+        // an acknowledgement was lost, and nobody knows what the controller
+        // has received.
+        let idle = self
+            .machine
+            .status
+            .as_ref()
+            .is_some_and(|st| st.state == "Idle");
+        if !s.inflight.is_empty()
+            && idle
+            && s.awaiting_reset.is_none()
+            && s.last_ack.elapsed() > self.config.ack_timeout
+        {
+            warn!(outstanding = s.inflight.len(), "acknowledgement lost");
+            if self.job.is_some() {
+                self.finish_job(
+                    JobState::Failed,
+                    Some("the controller stopped acknowledging lines".into()),
+                );
+                self.machine.last_error = Some("an acknowledgement was lost".into());
+                self.soft_reset(s).await?;
+            } else {
+                s.inflight.clear();
+                s.inflight_bytes = 0;
+            }
+        }
+
         if !self.machine.ready
             && s.awaiting_reset.is_none()
             && !s.inflight.iter().any(|f| f.origin == Origin::Info)
@@ -379,6 +484,7 @@ impl Actor {
             // Boards that reset when the port opens swallow anything sent
             // during boot, so keep asking until one probe is answered.
             s.info.attempts += 1;
+            s.info.saw_opt = false;
             s.info.next_at = Some(now + INFO_RETRY);
             debug!(attempt = s.info.attempts, "querying build info");
             self.send_line(s, "$I", Origin::Info).await?;
@@ -414,12 +520,19 @@ impl Actor {
             Response::Alarm(code) => {
                 warn!(code, "alarm");
                 self.machine.alarm = Some(code);
+                self.machine.alarm_message = Some(grbl::alarm_message(code).into());
                 if self
                     .job
                     .as_ref()
                     .is_some_and(|j| j.stop_requested.is_none())
                 {
-                    self.finish_job(JobState::Failed, Some(format!("controller alarm {code}")));
+                    self.finish_job(
+                        JobState::Failed,
+                        Some(format!(
+                            "controller alarm {code}: {}",
+                            grbl::alarm_message(code)
+                        )),
+                    );
                 }
             }
             Response::Banner { kind, version } => {
@@ -437,7 +550,7 @@ impl Actor {
                     s.inflight_bytes = 0;
                     if self.job.is_some() {
                         self.finish_job(
-                            JobState::Failed,
+                            JobState::Interrupted,
                             Some("the controller reset during the job".into()),
                         );
                     }
@@ -463,6 +576,7 @@ impl Actor {
                 status.work_offset = wco;
                 if status.state != "Alarm" {
                     self.machine.alarm = None;
+                    self.machine.alarm_message = None;
                 }
                 self.on_status(s, &status).await?;
                 self.machine.status = Some(status);
@@ -473,7 +587,11 @@ impl Actor {
                     let version = version.split('.').take(2).collect::<Vec<_>>().join(".");
                     s.info.version.get_or_insert(version);
                 }
-                "OPT" => s.info.rx_buffer = grbl::rx_buffer_from_opt(&body),
+                "OPT" => {
+                    s.info.saw_opt = true;
+                    s.info.rx_buffer = grbl::rx_buffer_from_opt(&body);
+                    s.info.planner_blocks = grbl::planner_blocks_from_opt(&body);
+                }
                 "FIRMWARE" if body.eq_ignore_ascii_case("grblhal") => {
                     s.info.kind = Some(FirmwareKind::Grblhal)
                 }
@@ -511,16 +629,25 @@ impl Actor {
         if s.awaiting_reset.is_some() {
             return Ok(());
         }
+        if error.is_none()
+            && s.inflight.front().is_some_and(|f| f.origin == Origin::Info)
+            && !s.info.saw_opt
+        {
+            debug!("ignoring an acknowledgement that predates this session");
+            return Ok(());
+        }
         let Some(done) = s.inflight.pop_front() else {
             debug!("acknowledgement with nothing in flight");
             return Ok(());
         };
         s.inflight_bytes -= done.bytes;
+        s.last_ack = Instant::now();
         match done.origin {
             Origin::Info => match error {
                 None => {
                     let kind = s.info.kind.unwrap_or(FirmwareKind::Grbl);
                     s.rx_buffer = s.info.rx_buffer.unwrap_or(DEFAULT_RX_BUFFER);
+                    s.planner_blocks = s.info.planner_blocks.unwrap_or(DEFAULT_PLANNER_BLOCKS);
                     self.machine.firmware = Some(Firmware {
                         kind,
                         version: s.info.version.clone().unwrap_or_default(),
@@ -532,6 +659,28 @@ impl Actor {
                 // Busy (error:8) or locked; the next tick asks again.
                 Some(code) => debug!(code, "build info query refused"),
             },
+            Origin::Internal => {
+                if let Some(code) = error {
+                    warn!(code, "command rejected");
+                    self.machine.last_error = Some(format!(
+                        "command rejected: error {code}, {}",
+                        grbl::error_message(code)
+                    ));
+                }
+            }
+            Origin::Preamble => {
+                if let Some(code) = error {
+                    // Without the right modal state, continuing would cut
+                    // in the wrong units or at the wrong speed.
+                    self.finish_job(
+                        JobState::Failed,
+                        Some(format!(
+                            "the controller rejected the lines that restore its state on resume: error {code}, {}",
+                            grbl::error_message(code)
+                        )),
+                    );
+                }
+            }
             Origin::Job(index) => {
                 if let Some(job) = &mut self.job {
                     job.record.acked_lines += 1;
@@ -543,6 +692,7 @@ impl Actor {
                         job.record.line_errors.push(LineError {
                             line: line.number,
                             code,
+                            message: grbl::error_message(code).into(),
                             text: line.text.clone(),
                         });
                         if job.record.state == JobState::Running {
@@ -551,8 +701,9 @@ impl Actor {
                             s.writer.write_all(&[realtime::FEED_HOLD]).await?;
                             job.record.state = JobState::Paused;
                             job.record.reason = Some(format!(
-                                "line {} was rejected with error {code}",
-                                line.number
+                                "line {} was rejected with error {code}: {}",
+                                line.number,
+                                grbl::error_message(code)
                             ));
                             self.save_progress(true);
                         }
@@ -583,6 +734,18 @@ impl Actor {
                     self.transition(JobState::Paused, Some("paused on request".into()));
                 }
                 let _ = reply.send(result.map(|_| self.active_record()));
+            }
+            Command::Resume(id, reply) if self.is_interrupted(&id) => {
+                let result = self.resume_interrupted(s, &id);
+                let ok = result.is_ok();
+                let _ = reply.send(result);
+                if ok {
+                    self.pump(s).await?;
+                }
+            }
+            Command::Machine(action, reply) => {
+                let result = self.machine_action(s, action).await?;
+                let _ = reply.send(result);
             }
             Command::Resume(id, reply) => {
                 let result = self.check_active(&id, &[JobState::Paused]);
@@ -622,20 +785,50 @@ impl Actor {
         let Some(mut record) = self.store.get(id)? else {
             return Err(ControlError::NotFound);
         };
+        self.check_ready()?;
+        let lines = self.store.program(id)?;
+        if lines.is_empty() {
+            return Err(ControlError::Invalid(
+                "the program has no lines to send".into(),
+            ));
+        }
+        self.check_program(s, &lines)?;
+        record.state = JobState::Running;
+        record.total_lines = lines.len();
+        record.acked_lines = 0;
+        record.last_acked_line = None;
+        record.started_at_ms = Some(now_ms());
+        record.finished_at_ms = None;
+        record.resumed_from_line = None;
+        record.reason = None;
+        record.line_errors.clear();
+        self.store.save(&record)?;
+        info!(id = %record.id, lines = lines.len(), "job started");
+        self.job = Some(ActiveJob {
+            record: record.clone(),
+            lines,
+            next: 0,
+            preamble: VecDeque::new(),
+            stop_requested: None,
+            resume_pending: false,
+            dirty: false,
+            last_saved: Instant::now(),
+        });
+        Ok(record)
+    }
+
+    /// Refuses to start or resume unless the machine is ready for a job.
+    fn check_ready(&self) -> Result<(), ControlError> {
         if let Some(active) = &self.job {
             return Err(ControlError::Conflict(format!(
                 "job {} is already active",
                 active.record.id
             )));
         }
-        if !self.machine.ready {
-            return Err(ControlError::Unavailable(
-                "the controller has not been identified yet".into(),
-            ));
-        }
         if let Some(code) = self.machine.alarm {
             return Err(ControlError::Conflict(format!(
-                "the machine is in alarm {code}"
+                "the machine is in alarm {code}: {}",
+                grbl::alarm_message(code)
             )));
         }
         if let Some(state) = self.machine.status.as_ref().map(|st| st.state.as_str())
@@ -645,12 +838,16 @@ impl Actor {
                 "the machine is {state}, not Idle"
             )));
         }
-        let lines = self.store.program(id)?;
-        if lines.is_empty() {
-            return Err(ControlError::Invalid(
-                "the program has no lines to send".into(),
+        if !self.machine.ready {
+            return Err(ControlError::Unavailable(
+                "the controller has not been identified yet".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Checks a program fits the controller and the machine's boundaries.
+    fn check_program(&self, s: &Session, lines: &[ProgramLine]) -> Result<(), ControlError> {
         let capacity = self.capacity(s);
         if let Some(long) = lines.iter().find(|l| l.text.len() + 1 > capacity) {
             return Err(ControlError::Invalid(format!(
@@ -658,26 +855,101 @@ impl Actor {
                 long.number
             )));
         }
+        let Some(limits) = self.store.bounds()? else {
+            return Ok(());
+        };
+        let status = self.machine.status.as_ref();
+        let three = |v: Option<&Vec<f64>>| v.filter(|v| v.len() >= 3).map(|v| [v[0], v[1], v[2]]);
+        let (Some(position), Some(offset)) = (
+            three(status.and_then(|st| st.machine_position.as_ref())),
+            three(status.and_then(|st| st.work_offset.as_ref())),
+        ) else {
+            return Err(ControlError::Unavailable(
+                "boundaries are set but the machine position or work offset has not been reported yet; try again".into(),
+            ));
+        };
+        bounds::check(&limits, lines, position, offset).map_err(ControlError::Invalid)
+    }
+
+    /// Continues a job that was interrupted by a lost connection, a restart
+    /// of the server, or a reset of the controller.
+    ///
+    /// The saved progress can lag the controller, and a reset throws away
+    /// whatever was still in its planner, so the job backs up past the
+    /// planner depth. Re-running absolute moves is harmless; incremental
+    /// ones are not, so those programs cannot be resumed.
+    fn resume_interrupted(&mut self, s: &Session, id: &str) -> Result<JobRecord, ControlError> {
+        let Some(mut record) = self.store.get(id)? else {
+            return Err(ControlError::NotFound);
+        };
+        self.check_ready()?;
+        let lines = self.store.program(id)?;
+        self.check_program(s, &lines)?;
+
+        let index = record
+            .acked_lines
+            .saturating_sub(s.planner_blocks + 1)
+            .min(lines.len().saturating_sub(1));
+        let mut machine = Interpreter::new([0.0; 3], [0.0; 3]);
+        for line in &lines[..index] {
+            machine.step(&line.text).map_err(|e| {
+                ControlError::Invalid(format!(
+                    "line {} uses {}, which cannot be restored on resume; start the job again from the top",
+                    line.number, e.0
+                ))
+            })?;
+        }
+        if !machine.modal.absolute {
+            return Err(ControlError::Invalid(format!(
+                "the program is in incremental mode (G91) at line {}, so repeating lines is not safe; start the job again from the top",
+                lines[index].number
+            )));
+        }
+
         record.state = JobState::Running;
-        record.total_lines = lines.len();
-        record.acked_lines = 0;
-        record.last_acked_line = None;
-        record.started_at_ms = Some(now_ms());
+        record.acked_lines = index;
+        record.last_acked_line = index.checked_sub(1).map(|i| lines[i].number);
+        record.resumed_from_line = Some(lines[index].number);
         record.finished_at_ms = None;
         record.reason = None;
-        record.line_errors.clear();
         self.store.save(&record)?;
-        info!(id = %record.id, lines = lines.len(), "job started");
+        info!(id = %record.id, from = lines[index].number, "job resumed");
         self.job = Some(ActiveJob {
             record: record.clone(),
             lines,
-            next: 0,
+            next: index,
+            preamble: machine.modal.preamble().into(),
             stop_requested: None,
             resume_pending: false,
             dirty: false,
             last_saved: Instant::now(),
         });
         Ok(record)
+    }
+
+    async fn machine_action(
+        &mut self,
+        s: &mut Session,
+        action: MachineAction,
+    ) -> std::io::Result<Result<(), ControlError>> {
+        if let Some(job) = &self.job {
+            return Ok(Err(ControlError::Conflict(format!(
+                "job {} is active; stop it first",
+                job.record.id
+            ))));
+        }
+        if !self.machine.ready && action != MachineAction::Reset {
+            return Ok(Err(ControlError::Unavailable(
+                "the controller has not been identified yet".into(),
+            )));
+        }
+        self.machine.last_error = None;
+        match action {
+            MachineAction::Unlock => self.send_line(s, "$X", Origin::Internal).await?,
+            MachineAction::Home => self.send_line(s, "$H", Origin::Internal).await?,
+            MachineAction::Reset => self.soft_reset(s).await?,
+        }
+        Ok(Ok(()))
     }
 
     fn check_active(&self, id: &str, allowed: &[JobState]) -> Result<(), ControlError> {
@@ -720,7 +992,27 @@ impl Actor {
             return Ok(());
         }
         let mut out = Vec::new();
-        while let Some(line) = job.lines.get(job.next) {
+        if s.inflight.is_empty() {
+            s.last_ack = Instant::now();
+        }
+        while let Some(text) = job.preamble.front() {
+            let bytes = text.len() + 1;
+            if s.inflight_bytes + bytes > capacity {
+                break;
+            }
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
+            s.inflight.push_back(InFlight {
+                origin: Origin::Preamble,
+                bytes,
+            });
+            s.inflight_bytes += bytes;
+            job.preamble.pop_front();
+        }
+        // Job lines wait until the preamble has gone out.
+        while job.preamble.is_empty()
+            && let Some(line) = job.lines.get(job.next)
+        {
             let bytes = line.text.len() + 1;
             if s.inflight_bytes + bytes > capacity {
                 break;
@@ -747,6 +1039,9 @@ impl Actor {
         origin: Origin,
     ) -> std::io::Result<()> {
         let bytes = text.len() + 1;
+        if s.inflight.is_empty() {
+            s.last_ack = Instant::now();
+        }
         s.writer.write_all(format!("{text}\n").as_bytes()).await?;
         s.inflight.push_back(InFlight { origin, bytes });
         s.inflight_bytes += bytes;

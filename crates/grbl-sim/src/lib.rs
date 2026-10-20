@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 
 /// Which firmware family to imitate.
@@ -110,8 +110,12 @@ struct State {
     overflowed: bool,
     max_rx: usize,
     resets: usize,
+    work_offset: [f64; 3],
+    reports: usize,
     // Fault injection.
     error_rules: Vec<(String, u32)>,
+    stalled: bool,
+    drop_acks: usize,
 }
 
 impl State {
@@ -131,7 +135,11 @@ impl State {
             overflowed: false,
             max_rx: 0,
             resets: 0,
+            work_offset: [0.0; 3],
+            reports: 0,
             error_rules: Vec::new(),
+            stalled: false,
+            drop_acks: 0,
         }
     }
 
@@ -163,13 +171,30 @@ impl State {
         }
     }
 
+    /// Acknowledges a line, unless a test asked for acknowledgements to be
+    /// lost on the wire.
+    fn ack(&mut self) {
+        if self.drop_acks > 0 {
+            self.drop_acks -= 1;
+        } else {
+            self.reply("ok");
+        }
+    }
+
     fn status_report(&mut self) {
         let [x, y, z] = self.position;
         let feed = if self.state_name() == "Run" { 1000 } else { 0 };
-        let report = format!(
-            "<{}|MPos:{x:.3},{y:.3},{z:.3}|FS:{feed},0>",
+        let mut report = format!(
+            "<{}|MPos:{x:.3},{y:.3},{z:.3}|FS:{feed},0",
             self.state_name()
         );
+        // Like real firmware, the work offset rides along only on some reports.
+        if self.reports.is_multiple_of(5) {
+            let [ox, oy, oz] = self.work_offset;
+            report.push_str(&format!("|WCO:{ox:.3},{oy:.3},{oz:.3}"));
+        }
+        self.reports += 1;
+        report.push('>');
         self.reply(&report);
     }
 
@@ -245,7 +270,7 @@ impl State {
 
     fn execute_line(&mut self, line: &str) {
         if line.is_empty() {
-            self.reply("ok");
+            self.ack();
             return;
         }
         if let Some(code) = self
@@ -268,7 +293,7 @@ impl State {
         match self.parse_motion(line) {
             Ok(block) => {
                 self.planner.push_back(block);
-                self.reply("ok");
+                self.ack();
             }
             Err(code) => self.reply(&format!("error:{code}")),
         }
@@ -280,12 +305,12 @@ impl State {
             "X" => {
                 self.alarm = None;
                 self.reply("[MSG:Caution: Unlocked]");
-                self.reply("ok");
+                self.ack();
             }
             "H" => {
                 self.alarm = None;
                 self.position = [0.0; 3];
-                self.reply("ok");
+                self.ack();
             }
             _ if !idle => self.reply("error:8"),
             "I" => {
@@ -310,21 +335,21 @@ impl State {
                         self.reply("[BOARD:SuperLongBoard]");
                     }
                 }
-                self.reply("ok");
+                self.ack();
             }
             "$" => {
                 self.reply("$0=10");
                 self.reply("$1=25");
                 self.reply("$10=1");
-                self.reply("ok");
+                self.ack();
             }
             "G" => {
                 self.reply("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]");
-                self.reply("ok");
+                self.ack();
             }
             "#" => {
                 self.reply("[G54:0.000,0.000,0.000]");
-                self.reply("ok");
+                self.ack();
             }
             _ => self.reply("error:3"),
         }
@@ -425,29 +450,40 @@ pub struct Simulator {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     link: PathBuf,
-    _slave: OwnedFd,
+    master: Arc<Mutex<Option<File>>>,
+    slave: Mutex<Option<OwnedFd>>,
+}
+
+/// Opens a pseudo-terminal pair and points `link` at its slave side. The
+/// simulator keeps the slave open itself so the master never sees EIO
+/// while the sender is between connections.
+fn open_pty(link: &Path) -> std::io::Result<(File, OwnedFd)> {
+    let pty = nix::pty::openpty(None, None)?;
+    let mut attrs = tcgetattr(pty.slave.as_fd())?;
+    cfmakeraw(&mut attrs);
+    tcsetattr(pty.slave.as_fd(), SetArg::TCSANOW, &attrs)?;
+    let slave_path = nix::unistd::ttyname(pty.slave.as_fd())?;
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(&slave_path, link)?;
+    let flags = OFlag::from_bits_truncate(fcntl(pty.master.as_fd(), FcntlArg::F_GETFL)?);
+    fcntl(
+        pty.master.as_fd(),
+        FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+    )?;
+    // The sender runs as a child process. If it inherited these descriptors,
+    // closing them here would not hang up the port, as unplugging a cable does.
+    for fd in [pty.master.as_fd(), pty.slave.as_fd()] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    }
+    Ok((File::from(pty.master), pty.slave))
 }
 
 impl Simulator {
     /// Starts a simulator whose serial port appears at `link`.
     pub fn start(config: SimConfig, link: impl AsRef<Path>) -> std::io::Result<Self> {
         let link = link.as_ref().to_path_buf();
-        let pty = nix::pty::openpty(None, None)?;
-        // Keep the slave side open ourselves so the master never sees EIO
-        // while the sender is between connections.
-        let mut attrs = tcgetattr(pty.slave.as_fd())?;
-        cfmakeraw(&mut attrs);
-        tcsetattr(pty.slave.as_fd(), SetArg::TCSANOW, &attrs)?;
-        let slave_path = nix::unistd::ttyname(pty.slave.as_fd())?;
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&slave_path, &link)?;
-
-        let flags = OFlag::from_bits_truncate(fcntl(pty.master.as_fd(), FcntlArg::F_GETFL)?);
-        fcntl(
-            pty.master.as_fd(),
-            FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
-        )?;
-        let master = File::from(pty.master);
+        let (master, slave) = open_pty(&link)?;
+        let master = Arc::new(Mutex::new(Some(master)));
 
         let mut state = State::new(config.clone());
         if config.banner_on_start {
@@ -459,6 +495,7 @@ impl Simulator {
         let thread = {
             let state = state.clone();
             let stop = stop.clone();
+            let master = master.clone();
             std::thread::spawn(move || run(master, state, stop))
         };
         Ok(Self {
@@ -466,7 +503,8 @@ impl Simulator {
             stop,
             thread: Some(thread),
             link,
-            _slave: pty.slave,
+            master,
+            slave: Mutex::new(Some(slave)),
         })
     }
 
@@ -545,10 +583,65 @@ impl Simulator {
     /// handle open, so without this a second sender could not open the
     /// port after the first exits (unless it runs as root).
     pub fn release_port(&self) {
-        // SAFETY: TIOCNXCL takes no argument and the fd is owned by self.
-        unsafe {
-            libc::ioctl(self._slave.as_raw_fd(), libc::TIOCNXCL);
+        if let Some(slave) = self.slave.lock().unwrap().as_ref() {
+            // SAFETY: TIOCNXCL takes no argument and the fd is owned by self.
+            unsafe {
+                libc::ioctl(slave.as_raw_fd(), libc::TIOCNXCL);
+            }
         }
+    }
+
+    /// Unplugs the cable: the port disappears and anything the controller
+    /// was about to say is lost. The machine itself keeps running whatever
+    /// is in its planner.
+    pub fn disconnect(&self) {
+        let mut state = self.lock();
+        state.out.clear();
+        *self.master.lock().unwrap() = None;
+        self.slave.lock().unwrap().take();
+        let _ = std::fs::remove_file(&self.link);
+    }
+
+    /// Plugs the cable back in. Boards with a USB serial chip that toggles
+    /// DTR (the Arduino based LongBoard) reset when the port is opened, so
+    /// pass `reset: true` for those. The SuperLongBoard does not.
+    pub fn reconnect(&self, reset: bool) -> std::io::Result<()> {
+        let (master, slave) = open_pty(&self.link)?;
+        let mut state = self.lock();
+        if reset {
+            state.soft_reset();
+        }
+        *self.master.lock().unwrap() = Some(master);
+        *self.slave.lock().unwrap() = Some(slave);
+        Ok(())
+    }
+
+    /// Makes the controller go silent: it ignores everything it receives
+    /// and says nothing, though the port stays open. Motion continues.
+    pub fn stall(&self, stalled: bool) {
+        self.lock().stalled = stalled;
+    }
+
+    /// Loses the next `n` acknowledgements on the wire.
+    pub fn drop_acks(&self, n: usize) {
+        self.lock().drop_acks = n;
+    }
+
+    /// Emits raw bytes, such as line noise, ahead of the next response.
+    pub fn inject(&self, bytes: &[u8]) {
+        self.lock().out.extend_from_slice(bytes);
+    }
+
+    /// Sets the G54 work offset reported in status reports.
+    pub fn set_work_offset(&self, offset: [f64; 3]) {
+        let mut s = self.lock();
+        s.work_offset = offset;
+        s.reports = 0;
+    }
+
+    /// Moves the machine, as a jog or an earlier job would have.
+    pub fn set_position(&self, position: [f64; 3]) {
+        self.lock().position = position;
     }
 
     pub fn set_block_duration(&self, d: Duration) {
@@ -566,39 +659,53 @@ impl Drop for Simulator {
     }
 }
 
-fn run(mut master: File, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>) {
+fn run(master: Arc<Mutex<Option<File>>>, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>) {
     let tick = Duration::from_millis(1);
     let mut buf = [0u8; 4096];
     let mut last = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let mut incoming = Vec::new();
-        loop {
-            match master.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => incoming.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
+        if let Some(port) = master.lock().unwrap().as_mut() {
+            loop {
+                match port.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => incoming.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
             }
         }
         let out = {
             let mut s = state.lock().unwrap();
-            for b in incoming {
-                s.feed_byte(b);
+            if !s.stalled {
+                for b in incoming {
+                    s.feed_byte(b);
+                }
+                s.process_lines();
             }
-            s.process_lines();
             let now = Instant::now();
             s.advance(now - last);
             last = now;
-            // Space freed in the planner lets more lines through.
-            s.process_lines();
-            std::mem::take(&mut s.out)
+            if !s.stalled {
+                // Space freed in the planner lets more lines through.
+                s.process_lines();
+            }
+            let out = std::mem::take(&mut s.out);
+            if s.stalled { Vec::new() } else { out }
         };
         let mut pending = &out[..];
         while !pending.is_empty() && !stop.load(Ordering::Relaxed) {
-            match master.write(pending) {
+            let mut guard = master.lock().unwrap();
+            let Some(port) = guard.as_mut() else {
+                break;
+            };
+            match port.write(pending) {
                 Ok(n) => pending = &pending[n..],
-                Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(tick),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    drop(guard);
+                    std::thread::sleep(tick);
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
