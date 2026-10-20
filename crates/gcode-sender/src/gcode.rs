@@ -60,9 +60,9 @@ impl Default for Modal {
 }
 
 impl Modal {
-    /// The lines that put a controller into this state.
-    pub fn preamble(&self) -> Vec<String> {
-        let mut lines = vec![format!(
+    /// Units, distance mode, plane, work offset and feed mode on one line.
+    pub fn state_line(&self) -> String {
+        format!(
             "{} {} {} G{} {}",
             if self.inches { "G20" } else { "G21" },
             if self.absolute { "G90" } else { "G91" },
@@ -73,7 +73,12 @@ impl Modal {
             },
             self.wcs,
             if self.inverse_time { "G93" } else { "G94" },
-        )];
+        )
+    }
+
+    /// Coolant, then spindle, if they are on.
+    pub fn tool_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
         if let Some(m) = self.coolant {
             lines.push(format!("M{m}"));
         }
@@ -83,9 +88,31 @@ impl Modal {
                 None => lines.push(format!("M{m}")),
             }
         }
-        if let Some(f) = &self.feed {
-            lines.push(format!("F{f}"));
+        lines
+    }
+
+    pub fn feed_line(&self) -> Option<String> {
+        self.feed.as_ref().map(|f| format!("F{f}"))
+    }
+
+    /// The feed rate in millimetres per minute, if it is a plain rate.
+    pub fn feed_mm_per_min(&self) -> Option<f64> {
+        if self.inverse_time {
+            return None;
         }
+        let feed: f64 = self.feed.as_ref()?.parse().ok()?;
+        Some(if self.inches {
+            feed * MM_PER_INCH
+        } else {
+            feed
+        })
+    }
+
+    /// The lines that put a controller into this state.
+    pub fn preamble(&self) -> Vec<String> {
+        let mut lines = vec![self.state_line()];
+        lines.extend(self.tool_lines());
+        lines.extend(self.feed_line());
         lines
     }
 }
