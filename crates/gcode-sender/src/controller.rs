@@ -99,6 +99,7 @@ enum Command {
     Stop(String, Reply<JobRecord>),
     Delete(String, Reply<()>),
     Machine(MachineAction, Reply<()>),
+    Jog(JogRequest, Reply<()>),
 }
 
 /// What to do differently when resuming a job that is not active.
@@ -136,6 +137,43 @@ pub enum MachineAction {
     Home,
     /// Soft reset, which also clears a feed hold left by an earlier session.
     Reset,
+    /// Realtime jog cancel: stop a jog in progress and drop the queued ones.
+    JogCancel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JogMode {
+    /// Move by the given distances from where the tool is.
+    #[default]
+    Relative,
+    /// Move to the given coordinates.
+    Absolute,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JogSpace {
+    /// Coordinates of the active work offset (G54).
+    #[default]
+    Work,
+    /// Coordinates measured from the machine's home.
+    Machine,
+}
+
+/// A short, interruptible move for positioning the tool by hand. Distances
+/// and feed are in millimetres and millimetres per minute.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JogRequest {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub z: Option<f64>,
+    pub feed: f64,
+    #[serde(default)]
+    pub mode: JogMode,
+    /// Only for absolute jogs. Defaults to the work coordinate system.
+    pub space: Option<JogSpace>,
 }
 
 #[derive(Clone)]
@@ -181,6 +219,10 @@ impl ControllerHandle {
     pub async fn machine(&self, action: MachineAction) -> Result<(), ControlError> {
         self.call(|r| Command::Machine(action, r)).await
     }
+    /// Resolves once the controller has accepted or refused the jog.
+    pub async fn jog(&self, request: JogRequest) -> Result<(), ControlError> {
+        self.call(|r| Command::Jog(request, r)).await
+    }
 }
 
 pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
@@ -205,6 +247,7 @@ pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
         snapshot_tx: snap_tx,
         machine: snapshot,
         job: None,
+        jog_target: None,
     };
     tokio::spawn(actor.run());
     ControllerHandle {
@@ -243,11 +286,28 @@ enum Origin {
     Preamble,
     /// An operator command such as `$X`.
     Internal,
+    /// A `$J=` jog; the caller waits for the controller's answer.
+    Jog,
 }
 
 struct InFlight {
     origin: Origin,
     bytes: usize,
+    /// Told what the controller answered, for commands someone waits on.
+    reply: Option<Reply<()>>,
+}
+
+/// Forgets what was sent. Anyone waiting on an answer is told the line may
+/// not have been executed.
+fn clear_inflight(s: &mut Session) {
+    for f in s.inflight.drain(..) {
+        if let Some(reply) = f.reply {
+            let _ = reply.send(Err(ControlError::Unavailable(
+                "the controller reset or went silent before it answered".into(),
+            )));
+        }
+    }
+    s.inflight_bytes = 0;
 }
 
 struct ActiveJob {
@@ -310,6 +370,8 @@ struct Actor {
     snapshot_tx: watch::Sender<MachineSnapshot>,
     machine: MachineSnapshot,
     job: Option<ActiveJob>,
+    /// Where the queued jogs will leave the tool, in machine coordinates.
+    jog_target: Option<([f64; 3], Instant)>,
 }
 
 /// Grbl 1.1 ships with a 128 byte RX buffer, the smallest in the family.
@@ -383,7 +445,7 @@ impl Actor {
             Command::Delete(id, r) => {
                 let _ = r.send(self.delete(&id));
             }
-            Command::Machine(_, r) => {
+            Command::Machine(_, r) | Command::Jog(_, r) => {
                 let _ = r.send(Err(ControlError::Unavailable(
                     "the machine is not connected".into(),
                 )));
@@ -508,8 +570,7 @@ impl Actor {
                 self.machine.last_error = Some("an acknowledgement was lost".into());
                 self.soft_reset(s).await?;
             } else {
-                s.inflight.clear();
-                s.inflight_bytes = 0;
+                clear_inflight(s);
             }
         }
 
@@ -583,8 +644,8 @@ impl Actor {
                 if s.awaiting_reset.is_some() {
                     self.after_reset(s);
                 } else {
-                    s.inflight.clear();
-                    s.inflight_bytes = 0;
+                    clear_inflight(s);
+                    self.jog_target = None;
                     if self.job.is_some() {
                         self.finish_job(
                             JobState::Interrupted,
@@ -705,6 +766,24 @@ impl Actor {
                     ));
                 }
             }
+            Origin::Jog => {
+                if let Some(reply) = done.reply {
+                    let _ = reply.send(match error {
+                        None => Ok(()),
+                        Some(code) => {
+                            self.jog_target = None;
+                            let message = format!(
+                                "the controller rejected the jog: error {code}, {}",
+                                grbl::error_message(code)
+                            );
+                            Err(match code {
+                                8 | 9 => ControlError::Conflict(message),
+                                _ => ControlError::Invalid(message),
+                            })
+                        }
+                    });
+                }
+            }
             Origin::Preamble => {
                 if let Some(code) = error {
                     // Without the right modal state, continuing would cut
@@ -784,6 +863,7 @@ impl Actor {
                 let result = self.machine_action(s, action).await?;
                 let _ = reply.send(result);
             }
+            Command::Jog(request, reply) => self.jog(s, request, reply).await?,
             Command::Resume(id, options, reply) => {
                 let mut result = self.check_active(&id, &[JobState::Paused]);
                 if result.is_ok() && (options.from_line.is_some() || options.retract.is_some()) {
@@ -1093,9 +1173,164 @@ impl Actor {
         match action {
             MachineAction::Unlock => self.send_line(s, "$X", Origin::Internal).await?,
             MachineAction::Home => self.send_line(s, "$H", Origin::Internal).await?,
-            MachineAction::Reset => self.soft_reset(s).await?,
+            MachineAction::Reset => {
+                self.jog_target = None;
+                self.soft_reset(s).await?
+            }
+            MachineAction::JogCancel => {
+                self.jog_target = None;
+                s.writer.write_all(&[realtime::JOG_CANCEL]).await?;
+            }
         }
         Ok(Ok(()))
+    }
+
+    /// Checks a jog is safe to send and works out where it ends.
+    ///
+    /// Returns the `$J=` line and, when the position is known, the machine
+    /// coordinates the tool will be at once every queued jog has run.
+    fn plan_jog(&self, request: &JogRequest) -> Result<(String, Option<[f64; 3]>), ControlError> {
+        let invalid = |m: &str| Err(ControlError::Invalid(m.into()));
+        if let Some(job) = &self.job {
+            return Err(ControlError::Conflict(format!(
+                "job {} is active; stop it first",
+                job.record.id
+            )));
+        }
+        if let Some(code) = self.machine.alarm {
+            return Err(ControlError::Conflict(format!(
+                "the machine is in alarm {code}: {}",
+                grbl::alarm_message(code)
+            )));
+        }
+        if !self.machine.ready {
+            return Err(ControlError::Unavailable(
+                "the controller has not been identified yet".into(),
+            ));
+        }
+        match self.machine.status.as_ref().map(|st| st.state.as_str()) {
+            Some("Idle" | "Jog") => {}
+            Some(state) => {
+                return Err(ControlError::Conflict(format!(
+                    "the machine is {state}, not Idle"
+                )));
+            }
+            None => {
+                return Err(ControlError::Unavailable(
+                    "the machine state has not been reported yet".into(),
+                ));
+            }
+        }
+        if !(request.feed.is_finite() && request.feed > 0.0) {
+            return invalid("feed must be a positive number");
+        }
+        let axes = [request.x, request.y, request.z];
+        if axes.iter().all(Option::is_none) {
+            return invalid("a jog needs at least one of x, y or z");
+        }
+        if axes.iter().flatten().any(|v| !v.is_finite()) {
+            return invalid("x, y and z must be numbers");
+        }
+        if request.mode == JogMode::Relative && request.space.is_some() {
+            return invalid("space only applies to absolute jogs");
+        }
+
+        let (position, offset) = self.known_position();
+        // Jogs already queued have not moved the tool yet, so a second one
+        // is measured from where the first will end.
+        let moving = self
+            .machine
+            .status
+            .as_ref()
+            .is_some_and(|st| st.state != "Idle");
+        let base = match self.jog_target {
+            Some((target, at)) if moving || at.elapsed() < self.config.poll_interval * 3 => {
+                Some(target)
+            }
+            _ => position,
+        };
+        let space = request.space.unwrap_or_default();
+        let mut line = String::from("$J=G21 ");
+        line.push_str(match (request.mode, space) {
+            (JogMode::Relative, _) => "G91",
+            (JogMode::Absolute, JogSpace::Work) => "G90",
+            (JogMode::Absolute, JogSpace::Machine) => "G90 G53",
+        });
+        let mut wanted = [None; 3];
+        for (i, name) in ["X", "Y", "Z"].iter().enumerate() {
+            let Some(v) = axes[i] else { continue };
+            line.push_str(&format!(" {name}{v:.3}"));
+            wanted[i] = match (request.mode, space) {
+                (JogMode::Relative, _) => base.map(|b| b[i] + v),
+                (JogMode::Absolute, JogSpace::Machine) => Some(v),
+                (JogMode::Absolute, JogSpace::Work) => offset.map(|o| o[i] + v),
+            };
+        }
+        line.push_str(&format!(" F{:.3}", request.feed));
+
+        if let Some(limits) = self.store.bounds()? {
+            if axes
+                .iter()
+                .zip(&wanted)
+                .any(|(a, w)| a.is_some() && w.is_none())
+            {
+                return Err(ControlError::Unavailable(
+                    "boundaries are set but the machine position or work offset has not been reported yet; try again".into(),
+                ));
+            }
+            limits.check_point(wanted).map_err(ControlError::Invalid)?;
+        }
+        let end = base.map(|b| {
+            let mut end = b;
+            for i in 0..3 {
+                if let Some(v) = wanted[i] {
+                    end[i] = v;
+                }
+            }
+            end
+        });
+        Ok((line, end))
+    }
+
+    async fn jog(
+        &mut self,
+        s: &mut Session,
+        request: JogRequest,
+        reply: Reply<()>,
+    ) -> std::io::Result<()> {
+        if s.awaiting_reset.is_some() {
+            let _ = reply.send(Err(ControlError::Unavailable(
+                "the controller is resetting".into(),
+            )));
+            return Ok(());
+        }
+        let (line, end) = match self.plan_jog(&request) {
+            Ok(planned) => planned,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return Ok(());
+            }
+        };
+        let bytes = line.len() + 1;
+        if s.inflight_bytes + bytes > self.capacity(s) {
+            let _ = reply.send(Err(ControlError::Conflict(
+                "the controller is still busy with earlier commands; try again".into(),
+            )));
+            return Ok(());
+        }
+        self.machine.last_error = None;
+        if s.inflight.is_empty() {
+            s.last_ack = Instant::now();
+        }
+        s.writer.write_all(format!("{line}\n").as_bytes()).await?;
+        s.inflight.push_back(InFlight {
+            origin: Origin::Jog,
+            bytes,
+            reply: Some(reply),
+        });
+        s.inflight_bytes += bytes;
+        self.jog_target = end.map(|e| (e, Instant::now()));
+        Ok(())
     }
 
     fn check_active(&self, id: &str, allowed: &[JobState]) -> Result<(), ControlError> {
@@ -1151,6 +1386,7 @@ impl Actor {
             s.inflight.push_back(InFlight {
                 origin: Origin::Preamble,
                 bytes,
+                reply: None,
             });
             s.inflight_bytes += bytes;
             job.preamble.pop_front();
@@ -1168,6 +1404,7 @@ impl Actor {
             s.inflight.push_back(InFlight {
                 origin: Origin::Job(job.next),
                 bytes,
+                reply: None,
             });
             s.inflight_bytes += bytes;
             job.next += 1;
@@ -1189,7 +1426,11 @@ impl Actor {
             s.last_ack = Instant::now();
         }
         s.writer.write_all(format!("{text}\n").as_bytes()).await?;
-        s.inflight.push_back(InFlight { origin, bytes });
+        s.inflight.push_back(InFlight {
+            origin,
+            bytes,
+            reply: None,
+        });
         s.inflight_bytes += bytes;
         Ok(())
     }
@@ -1203,8 +1444,8 @@ impl Actor {
     /// The controller has reset after a stop: nothing sent before survives.
     fn after_reset(&mut self, s: &mut Session) {
         s.awaiting_reset = None;
-        s.inflight.clear();
-        s.inflight_bytes = 0;
+        clear_inflight(s);
+        self.jog_target = None;
         s.info.next_at = None;
         if self
             .job

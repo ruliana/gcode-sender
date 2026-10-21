@@ -29,6 +29,22 @@ impl Bounds {
         Ok(())
     }
 
+    /// Checks a single destination, in machine coordinates. Axes that are
+    /// `None` are not being moved.
+    pub fn check_point(&self, target: [Option<f64>; 3]) -> Result<(), String> {
+        for (axis, name) in AXES.iter().enumerate() {
+            let (Some(at), Some([min, max])) = (target[axis], self.range(axis)) else {
+                continue;
+            };
+            if at < min - EPSILON || at > max + EPSILON {
+                return Err(format!(
+                    "the jog moves {name} to {at:.3}, outside the boundary {min} to {max}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn range(&self, axis: usize) -> Option<[f64; 2]> {
         [self.x, self.y, self.z][axis]
     }
