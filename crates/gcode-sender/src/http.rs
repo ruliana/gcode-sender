@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::bounds::Bounds;
-use crate::controller::{ControlError, ControllerHandle, MachineAction, ResumeOptions};
+use crate::controller::{ControlError, ControllerHandle, JogRequest, MachineAction, ResumeOptions};
 use crate::store::{JobRecord, JobStore};
 
 #[derive(Clone)]
@@ -29,6 +29,8 @@ pub fn router(state: AppState) -> Router {
         .route("/machine/unlock", post(unlock))
         .route("/machine/home", post(home))
         .route("/machine/reset", post(reset))
+        .route("/machine/jog", post(jog))
+        .route("/machine/jog/cancel", post(jog_cancel))
         .route(
             "/machine/bounds",
             get(get_bounds).put(put_bounds).delete(delete_bounds),
@@ -198,6 +200,26 @@ async fn home(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_
 
 async fn reset(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     machine_action(app, MachineAction::Reset).await
+}
+
+async fn jog(
+    State(app): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let request = parse_json::<JogRequest>(&body)?.ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a JSON body is required".into(),
+        )
+    })?;
+    app.controller.jog(request).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))))
+}
+
+async fn jog_cancel(
+    State(app): State<AppState>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    machine_action(app, MachineAction::JogCancel).await
 }
 
 async fn get_bounds(State(app): State<AppState>) -> ApiResult<Json<Bounds>> {

@@ -128,6 +128,17 @@ impl Harness {
         decode(res).await
     }
 
+    pub async fn post_json(&self, path: &str, body: &Value) -> (StatusCode, Value) {
+        let res = self
+            .client
+            .post(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        decode(res).await
+    }
+
     pub async fn put_json(&self, path: &str, body: &Value) -> (StatusCode, Value) {
         let res = self
             .client

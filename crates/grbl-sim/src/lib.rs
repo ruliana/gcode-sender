@@ -90,6 +90,7 @@ enum Hold {
 struct Block {
     target: Option<[f64; 3]>,
     remaining: Duration,
+    jog: bool,
 }
 
 /// Everything the simulator knows, shared between its thread and the test.
@@ -111,6 +112,8 @@ struct State {
     max_rx: usize,
     resets: usize,
     work_offset: [f64; 3],
+    /// Soft limits: jogs past them are refused with error:15.
+    travel: Option<([f64; 3], [f64; 3])>,
     reports: usize,
     // Fault injection.
     error_rules: Vec<(String, u32)>,
@@ -136,6 +139,7 @@ impl State {
             max_rx: 0,
             resets: 0,
             work_offset: [0.0; 3],
+            travel: None,
             reports: 0,
             error_rules: Vec::new(),
             stalled: false,
@@ -155,6 +159,13 @@ impl State {
         }
     }
 
+    fn jogging(&self) -> bool {
+        self.current
+            .iter()
+            .chain(self.planner.iter())
+            .any(|b| b.jog)
+    }
+
     fn moving(&self) -> bool {
         self.current.is_some() || !self.planner.is_empty()
     }
@@ -166,6 +177,7 @@ impl State {
         match self.hold {
             Hold::Decelerating(_) => "Hold:1",
             Hold::Complete => "Hold:0",
+            Hold::None if self.jogging() => "Jog",
             Hold::None if self.moving() => "Run",
             Hold::None => "Idle",
         }
@@ -223,6 +235,14 @@ impl State {
             0x18 => {
                 self.realtime.push(b);
                 self.soft_reset();
+            }
+            0x85 => {
+                self.realtime.push(b);
+                if self.jogging() {
+                    // Jog cancel stops the motion and flushes the planner.
+                    self.planner.clear();
+                    self.current = None;
+                }
             }
             0x83..=0xff => self.realtime.push(b),
             _ => {
@@ -312,6 +332,7 @@ impl State {
                 self.position = [0.0; 3];
                 self.ack();
             }
+            _ if cmd.starts_with("J=") => self.jog(&cmd[2..]),
             _ if !idle => self.reply("error:8"),
             "I" => {
                 match self.config.firmware {
@@ -355,6 +376,91 @@ impl State {
         }
     }
 
+    /// `$J=`: a jog. It moves like a G1 but leaves the parser's modal state
+    /// alone, and is only accepted when idle or already jogging.
+    fn jog(&mut self, words: &str) {
+        if self.alarm.is_some() {
+            self.reply("error:9");
+            return;
+        }
+        if self.hold != Hold::None || (self.moving() && !self.jogging()) {
+            self.reply("error:8");
+            return;
+        }
+        let mut absolute = self.absolute;
+        let mut machine_coords = false;
+        let mut axes: [Option<f64>; 3] = [None; 3];
+        let mut feed = None;
+        let upper = words.to_ascii_uppercase();
+        let mut chars = upper.chars().filter(|c| !c.is_whitespace()).peekable();
+        while let Some(letter) = chars.next() {
+            let mut number = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() || matches!(c, '.' | '-' | '+') {
+                    number.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let Ok(value) = number.parse::<f64>() else {
+                self.reply("error:2");
+                return;
+            };
+            match (letter, value as i64) {
+                ('G', 90) => absolute = true,
+                ('G', 91) => absolute = false,
+                ('G', 53) => machine_coords = true,
+                ('G', 20 | 21) => {}
+                ('X', _) => axes[0] = Some(value),
+                ('Y', _) => axes[1] = Some(value),
+                ('Z', _) => axes[2] = Some(value),
+                ('F', _) => feed = Some(value),
+                _ => {
+                    self.reply("error:20");
+                    return;
+                }
+            }
+        }
+        if feed.is_none() {
+            self.reply("error:22");
+            return;
+        }
+        if axes.iter().all(Option::is_none) {
+            self.reply("error:33");
+            return;
+        }
+        let base = self
+            .planner
+            .iter()
+            .rev()
+            .chain(self.current.iter())
+            .find_map(|b| b.target)
+            .unwrap_or(self.position);
+        let mut target = base;
+        for (i, axis) in axes.iter().enumerate() {
+            if let Some(v) = axis {
+                target[i] = match (absolute, machine_coords) {
+                    (false, _) => base[i] + v,
+                    (true, true) => *v,
+                    (true, false) => v + self.work_offset[i],
+                };
+            }
+        }
+        if let Some((low, high)) = self.travel
+            && (0..3).any(|i| target[i] < low[i] || target[i] > high[i])
+        {
+            self.reply("error:15");
+            return;
+        }
+        self.planner.push_back(Block {
+            target: Some(target),
+            remaining: self.config.block_duration,
+            jog: true,
+        });
+        self.ack();
+    }
+
     /// A deliberately small G-code model: only the words that move the
     /// simulated position are interpreted. Anything with an X, Y, or Z word
     /// is a motion block that takes `block_duration` to run.
@@ -391,6 +497,7 @@ impl State {
             return Ok(Block {
                 target: None,
                 remaining: Duration::ZERO,
+                jog: false,
             });
         }
         // Targets are resolved against the end of the queued motion.
@@ -410,6 +517,7 @@ impl State {
         Ok(Block {
             target: Some(target),
             remaining: self.config.block_duration,
+            jog: false,
         })
     }
 
@@ -637,6 +745,12 @@ impl Simulator {
         let mut s = self.lock();
         s.work_offset = offset;
         s.reports = 0;
+    }
+
+    /// Soft limits in machine coordinates. A jog that would leave them is
+    /// refused with `error:15`, as Grbl does with soft limits enabled.
+    pub fn set_travel(&self, low: [f64; 3], high: [f64; 3]) {
+        self.lock().travel = Some((low, high));
     }
 
     /// Moves the machine, as a jog or an earlier job would have.

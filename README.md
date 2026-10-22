@@ -66,11 +66,13 @@ identified yet.
 | `POST /machine/unlock` | `$X`: clear an alarm lock |
 | `POST /machine/home` | `$H`: run the homing cycle |
 | `POST /machine/reset` | Soft reset, for example to clear a hold left by an earlier session |
+| `POST /machine/jog` | Move the tool by hand, see below |
+| `POST /machine/jog/cancel` | Stop a jog in progress and drop the queued ones |
 | `GET /machine/bounds` | The machine boundaries, see below |
 | `PUT /machine/bounds` | Set the boundaries |
 | `DELETE /machine/bounds` | Remove the boundaries |
 
-The three `/machine` actions are refused while a job is active; stop the job
+The `/machine` actions are refused while a job is active; stop the job
 first.
 
 Only one job is active at a time. A job's `state` is one of `loaded`,
@@ -175,6 +177,40 @@ The server will not resume until you have dealt with the alarm.
   over from an earlier session are discarded while the controller is
   identified, so they cannot be mistaken for the new session's replies.
 
+### Jogging
+
+`POST /machine/jog` sends a Grbl `$J=` jog, which the controller runs
+as a short move that can be cancelled at any moment. Distances and feed are
+in millimetres and millimetres per minute.
+
+```sh
+# Move 10 mm along X and 2.5 mm back along Y from where the tool is.
+curl -X POST localhost:8080/machine/jog -H 'content-type: application/json' \
+  -d '{"x": 10, "y": -2.5, "feed": 1500}'
+
+# Go to X0 Y0 in work coordinates, or add "space": "machine" for machine
+# coordinates.
+curl -X POST localhost:8080/machine/jog -H 'content-type: application/json' \
+  -d '{"x": 0, "y": 0, "feed": 3000, "mode": "absolute"}'
+
+curl -X POST localhost:8080/machine/jog/cancel
+```
+
+`mode` is `relative` (the default) or `absolute`; `space` (`work`, the
+default, or `machine`) only applies to absolute jogs. The reply is `202`
+once the controller has accepted the move, not when it finishes: watch
+`GET /machine`, where the state is `Jog` while it runs. A jog the
+controller refuses comes back with its error, for example `422` for
+error:15 (the move leaves the machine's travel). Jogs sent while one is
+running queue behind it, and cancelling drops them all. The cancel is a
+realtime byte, so the machine does not reset and keeps its position.
+
+Jogging is refused (`409`) during a job, an alarm, a hold or any other
+state that is not idle, and (`503`) while disconnected. When boundaries are
+set, the destination is checked first, counting the jogs still queued, and a
+jog that leaves them is refused with `422`. As with jobs, this is on top of
+the controller's soft limits, not instead of them.
+
 ### Boundaries
 
 `PUT /machine/bounds` takes ranges in machine coordinates, in millimetres.
@@ -222,7 +258,7 @@ The tests need Linux or macOS for pseudo-terminals.
 
 ## Not done yet
 
-- Jogging, probing, and overrides.
+- Probing and overrides.
 - Reading and changing the controller's `$` settings.
 - Resuming incremental programs.
 - Testing against a real LongMill. The simulator follows the Grbl 1.1

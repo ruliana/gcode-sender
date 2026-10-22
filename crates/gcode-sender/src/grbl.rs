@@ -8,6 +8,7 @@ pub mod realtime {
     pub const FEED_HOLD: u8 = b'!';
     pub const CYCLE_START: u8 = b'~';
     pub const SOFT_RESET: u8 = 0x18;
+    pub const JOG_CANCEL: u8 = 0x85;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
