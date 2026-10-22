@@ -112,6 +112,8 @@ struct State {
     max_rx: usize,
     resets: usize,
     work_offset: [f64; 3],
+    /// Real firmware reports the offset on the next status after it changes.
+    wco_pending: bool,
     /// Soft limits: jogs past them are refused with error:15.
     travel: Option<([f64; 3], [f64; 3])>,
     reports: usize,
@@ -139,6 +141,7 @@ impl State {
             max_rx: 0,
             resets: 0,
             work_offset: [0.0; 3],
+            wco_pending: false,
             travel: None,
             reports: 0,
             error_rules: Vec::new(),
@@ -201,7 +204,8 @@ impl State {
             self.state_name()
         );
         // Like real firmware, the work offset rides along only on some reports.
-        if self.reports.is_multiple_of(5) {
+        if self.reports.is_multiple_of(5) || self.wco_pending {
+            self.wco_pending = false;
             let [ox, oy, oz] = self.work_offset;
             report.push_str(&format!("|WCO:{ox:.3},{oy:.3},{oz:.3}"));
         }
@@ -310,6 +314,13 @@ impl State {
             self.reply("error:9");
             return;
         }
+        if line.to_ascii_uppercase().contains("G10") {
+            match self.set_offset(line) {
+                Ok(()) => self.ack(),
+                Err(code) => self.reply(&format!("error:{code}")),
+            }
+            return;
+        }
         match self.parse_motion(line) {
             Ok(block) => {
                 self.planner.push_back(block);
@@ -374,6 +385,55 @@ impl State {
             }
             _ => self.reply("error:3"),
         }
+    }
+
+    /// `G10 L2/L20 P1`: sets the G54 work offset. `L2` takes machine
+    /// coordinates; `L20` takes the work coordinates of the current position.
+    fn set_offset(&mut self, line: &str) -> Result<(), u32> {
+        let upper = line.to_ascii_uppercase();
+        let mut chars = upper.chars().filter(|c| !c.is_whitespace()).peekable();
+        let (mut l, mut p) = (None, None);
+        let mut axes: [Option<f64>; 3] = [None; 3];
+        let mut absolute = self.absolute;
+        while let Some(letter) = chars.next() {
+            let mut number = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() || matches!(c, '.' | '-' | '+') {
+                    number.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let value: f64 = number.parse().map_err(|_| 2u32)?;
+            match (letter, value as i64) {
+                ('G', 10 | 21) => {}
+                ('G', 90) => absolute = true,
+                ('L', n) => l = Some(n),
+                ('P', n) => p = Some(n),
+                ('X', _) => axes[0] = Some(value),
+                ('Y', _) => axes[1] = Some(value),
+                ('Z', _) => axes[2] = Some(value),
+                _ => return Err(20),
+            }
+        }
+        let (Some(l), Some(p)) = (l, p) else {
+            return Err(28);
+        };
+        if !matches!(l, 2 | 20) || !matches!(p, 0 | 1) {
+            return Err(20);
+        }
+        if self.moving() || self.hold != Hold::None {
+            return Err(8);
+        }
+        self.absolute = absolute;
+        for (i, v) in axes.iter().enumerate() {
+            if let Some(v) = v {
+                self.work_offset[i] = if l == 2 { *v } else { self.position[i] - v };
+            }
+        }
+        self.wco_pending = true;
+        Ok(())
     }
 
     /// `$J=`: a jog. It moves like a G1 but leaves the parser's modal state
@@ -741,6 +801,10 @@ impl Simulator {
     }
 
     /// Sets the G54 work offset reported in status reports.
+    pub fn work_offset(&self) -> [f64; 3] {
+        self.lock().work_offset
+    }
+
     pub fn set_work_offset(&self, offset: [f64; 3]) {
         let mut s = self.lock();
         s.work_offset = offset;

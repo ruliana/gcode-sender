@@ -7,13 +7,16 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::bounds::Bounds;
-use crate::controller::{ControlError, ControllerHandle, JogRequest, MachineAction, ResumeOptions};
+use crate::controller::{
+    AxisValues, ControlError, ControllerHandle, JogRequest, MachineAction, ResumeOptions,
+    WorkChange,
+};
 use crate::store::{JobRecord, JobStore};
 
 #[derive(Clone)]
@@ -29,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .route("/machine/unlock", post(unlock))
         .route("/machine/home", post(home))
         .route("/machine/reset", post(reset))
+        .route("/machine/work-zero", post(work_zero))
+        .route("/machine/work-offset", put(work_offset))
         .route("/machine/jog", post(jog))
         .route("/machine/jog/cancel", post(jog_cancel))
         .route(
@@ -200,6 +205,35 @@ async fn home(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_
 
 async fn reset(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     machine_action(app, MachineAction::Reset).await
+}
+
+async fn work_change(
+    app: AppState,
+    change: WorkChange,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let values = parse_json::<AxisValues>(&body)?.ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a JSON body is required".into(),
+        )
+    })?;
+    app.controller.work(change, values).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))))
+}
+
+async fn work_zero(
+    State(app): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    work_change(app, WorkChange::Zero, body).await
+}
+
+async fn work_offset(
+    State(app): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    work_change(app, WorkChange::Offset, body).await
 }
 
 async fn jog(

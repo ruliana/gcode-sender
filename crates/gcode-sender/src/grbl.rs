@@ -52,7 +52,8 @@ pub struct Status {
     pub feed_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spindle_speed: Option<f64>,
-    #[serde(skip)]
+    /// The G54 work offset in machine coordinates, as last reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub work_offset: Option<Vec<f64>>,
 }
 

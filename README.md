@@ -66,6 +66,8 @@ identified yet.
 | `POST /machine/unlock` | `$X`: clear an alarm lock |
 | `POST /machine/home` | `$H`: run the homing cycle |
 | `POST /machine/reset` | Soft reset, for example to clear a hold left by an earlier session |
+| `POST /machine/work-zero` | Make the tool's current position a work coordinate, see below |
+| `PUT /machine/work-offset` | Set where work zero is in machine coordinates, see below |
 | `POST /machine/jog` | Move the tool by hand, see below |
 | `POST /machine/jog/cancel` | Stop a jog in progress and drop the queued ones |
 | `GET /machine/bounds` | The machine boundaries, see below |
@@ -210,6 +212,41 @@ state that is not idle, and (`503`) while disconnected. When boundaries are
 set, the destination is checked first, counting the jogs still queued, and a
 jog that leaves them is refused with `422`. As with jobs, this is on top of
 the controller's soft limits, not instead of them.
+
+### Work zero
+
+The work zero is the G54 offset, which the controller keeps through power
+cycles. `GET /machine` reports it as `status.work_offset`, in machine
+coordinates, next to `machine_position` and `work_position`.
+
+```sh
+# The tool is at the corner of the stock: call this X0 Y0.
+curl -X POST localhost:8080/machine/work-zero -H 'content-type: application/json' \
+  -d '{"x": 0, "y": 0}'
+
+# The tool is touching the top of a 10 mm board: call this Z10.
+curl -X POST localhost:8080/machine/work-zero -H 'content-type: application/json' \
+  -d '{"z": 10}'
+
+# Put work zero at a known place on the machine.
+curl -X PUT localhost:8080/machine/work-offset -H 'content-type: application/json' \
+  -d '{"x": -100, "y": -50}'
+```
+
+`work-zero` sends `G10 L20 P1` and `work-offset` sends `G10 L2 P1`. Both
+take any of `x`, `y` and `z`, in millimetres, and leave the other axes
+alone. They send `G21 G90` first, so the controller is left in millimetres
+and absolute mode whatever it was in before. Only G54 is supported. A
+change is refused (`409`) during a job, an alarm, or any state but idle,
+because the new zero is measured from where the tool is at that moment.
+
+A job remembers the work offset it ran with (`work_offset` on the job).
+Resuming a stopped, failed or interrupted job after the zero has moved is
+refused with `409`, since the rest of the program would be cut somewhere
+else. Put the zero back, or pass `"accept_moved_zero": true` to resume
+anyway. Boundaries are in machine coordinates, so they stay put when the
+zero moves; a program is checked against them using the offset in effect
+when it starts.
 
 ### Boundaries
 
