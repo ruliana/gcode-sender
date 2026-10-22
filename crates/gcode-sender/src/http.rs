@@ -1,21 +1,26 @@
 //! The HTTP API. Handlers are thin: reads come from the job store or the
 //! controller snapshot, and every job transition goes through the controller.
 
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::watch;
 
 use crate::bounds::Bounds;
 use crate::controller::{
-    AxisValues, ControlError, ControllerHandle, JogRequest, MachineAction, ResumeOptions,
-    WorkChange,
+    AxisValues, ControlError, ControllerHandle, JogRequest, MachineAction, MachineSnapshot,
+    ResumeOptions, WorkChange,
 };
 use crate::store::{JobRecord, JobStore};
 
@@ -23,11 +28,14 @@ use crate::store::{JobRecord, JobStore};
 pub struct AppState {
     pub store: Arc<JobStore>,
     pub controller: ControllerHandle,
+    /// Turns true when the server is shutting down, to end open event streams.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/events", get(events))
         .route("/machine", get(machine))
         .route("/machine/unlock", post(unlock))
         .route("/machine/home", post(home))
@@ -277,4 +285,99 @@ async fn put_bounds(State(app): State<AppState>, body: Bytes) -> ApiResult<Json<
 async fn delete_bounds(State(app): State<AppState>) -> ApiResult<StatusCode> {
     app.store.set_bounds(None)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The longest a change waits before it is sent. Changes that arrive within
+/// this window are folded into one event carrying the latest state.
+const EVENT_INTERVAL: Duration = Duration::from_millis(100);
+
+struct EventFeed {
+    snapshot: watch::Receiver<MachineSnapshot>,
+    shutdown: watch::Receiver<bool>,
+    store: Arc<JobStore>,
+    started: bool,
+    pending: VecDeque<Event>,
+    last_machine: Option<String>,
+    last_job: Option<String>,
+    /// The job last seen active, whose final record is sent when it ends.
+    last_active: Option<String>,
+}
+
+impl EventFeed {
+    fn push(&mut self, name: &str, data: String) {
+        self.pending
+            .push_back(Event::default().event(name).data(data));
+    }
+
+    /// Queues what changed since the last snapshot this client was sent. A
+    /// job's record goes first, so the machine event that follows already
+    /// shows its effect.
+    fn update(&mut self, snapshot: &MachineSnapshot) {
+        match &snapshot.active_job {
+            Some(job) => {
+                let data = serde_json::to_string(job).unwrap_or_default();
+                if self.last_job.as_ref() != Some(&data) {
+                    self.push("job", data.clone());
+                    self.last_job = Some(data);
+                }
+                self.last_active = Some(job.id.clone());
+            }
+            None => {
+                // The job ended; its last state is on disk.
+                if let Some(id) = self.last_active.take()
+                    && let Ok(Some(job)) = self.store.get(&id)
+                {
+                    let data = serde_json::to_string(&job).unwrap_or_default();
+                    self.push("job", data.clone());
+                    self.last_job = Some(data);
+                }
+            }
+        }
+        let machine = serde_json::to_string(snapshot).unwrap_or_default();
+        if self.last_machine.as_ref() != Some(&machine) {
+            self.push("machine", machine.clone());
+            self.last_machine = Some(machine);
+        }
+    }
+
+    async fn next(mut self) -> Option<(Result<Event, Infallible>, Self)> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some((Ok(event), self));
+            }
+            if self.started {
+                tokio::select! {
+                    changed = self.snapshot.changed() => changed.ok()?,
+                    _ = self.shutdown.changed() => return None,
+                }
+                tokio::time::sleep(EVENT_INTERVAL).await;
+            }
+            self.started = true;
+            let snapshot = self.snapshot.borrow_and_update().clone();
+            self.update(&snapshot);
+        }
+    }
+}
+
+/// A server-sent event stream of everything `GET /machine` and
+/// `GET /jobs/{id}` report. It starts with the current state, so a client
+/// that reconnects needs nothing else to catch up.
+///
+/// `machine` events carry the machine snapshot. `job` events carry a job
+/// record whenever the active job changes, and once more with its final
+/// state when it ends.
+async fn events(
+    State(app): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let feed = EventFeed {
+        snapshot: app.controller.subscribe(),
+        shutdown: app.shutdown,
+        store: app.store,
+        started: false,
+        pending: VecDeque::new(),
+        last_machine: None,
+        last_job: None,
+        last_active: None,
+    };
+    Sse::new(futures::stream::unfold(feed, EventFeed::next)).keep_alive(KeepAlive::default())
 }

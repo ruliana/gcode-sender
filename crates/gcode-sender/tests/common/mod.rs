@@ -100,6 +100,33 @@ impl Harness {
         }
     }
 
+    /// Sends the server Ctrl-C and waits for it to exit.
+    pub async fn interrupt_server(&mut self) -> std::process::ExitStatus {
+        let mut child = self.server.take().expect("server running");
+        let pid = child.id().expect("server pid");
+        let status = std::process::Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let exit = tokio::time::timeout(TIMEOUT, child.wait())
+            .await
+            .expect("the server did not shut down")
+            .unwrap();
+        self.sim.release_port();
+        exit
+    }
+
+    /// Opens `GET /events`.
+    pub async fn events(&self) -> EventStream {
+        let res = self.client.get(self.url("/events")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        EventStream {
+            res,
+            buf: Vec::new(),
+        }
+    }
+
     /// Starts a new server process on the same data directory.
     pub async fn restart_server(&mut self) {
         self.kill_server().await;
@@ -306,4 +333,83 @@ pub fn program_lines(sim: &Simulator) -> Vec<String> {
         .into_iter()
         .filter(|l| !l.starts_with('$'))
         .collect()
+}
+
+/// A client of the server-sent event stream.
+pub struct EventStream {
+    res: reqwest::Response,
+    buf: Vec<u8>,
+}
+
+impl EventStream {
+    pub fn content_type(&self) -> String {
+        self.res
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The next event, or `None` if nothing arrives within `wait`. Panics
+    /// if the server closes the stream.
+    pub async fn next_within(&mut self, wait: Duration) -> Option<(String, Value)> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
+                let raw: Vec<u8> = self.buf.drain(..end + 2).collect();
+                let text = String::from_utf8_lossy(&raw);
+                let mut name = None;
+                let mut data = String::new();
+                for line in text.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        name = Some(v.trim().to_string());
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim_start());
+                    }
+                }
+                // Comments such as keep-alives have neither.
+                if let Some(name) = name {
+                    return Some((
+                        name,
+                        serde_json::from_str(&data).expect("event data is JSON"),
+                    ));
+                }
+                continue;
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, self.res.chunk()).await {
+                Err(_) => return None,
+                Ok(chunk) => match chunk.unwrap() {
+                    Some(bytes) => self.buf.extend_from_slice(&bytes),
+                    None => panic!("the event stream was closed"),
+                },
+            }
+        }
+    }
+
+    pub async fn next(&mut self) -> (String, Value) {
+        self.next_within(TIMEOUT)
+            .await
+            .expect("timed out waiting for an event")
+    }
+
+    /// Reads events until one named `name` satisfies `pred`.
+    pub async fn wait_for(
+        &mut self,
+        name: &str,
+        what: &str,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Some((got, data)) = self.next_within(left).await else {
+                panic!("timed out waiting for {what}");
+            };
+            if got == name && pred(&data) {
+                return data;
+            }
+        }
+    }
 }

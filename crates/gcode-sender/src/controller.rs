@@ -209,6 +209,11 @@ impl ControllerHandle {
         self.snapshot.borrow().clone()
     }
 
+    /// A receiver that wakes whenever the snapshot is published.
+    pub fn subscribe(&self) -> watch::Receiver<MachineSnapshot> {
+        self.snapshot.clone()
+    }
+
     async fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> Result<T, ControlError> {
         let (tx, rx) = oneshot::channel();
         self.tx

@@ -53,6 +53,7 @@ identified yet.
 | Method and path | What it does |
 | --- | --- |
 | `GET /health` | Liveness check |
+| `GET /events` | Live stream of machine and job changes, see below |
 | `GET /machine` | Connection, firmware, live status, alarm, and the active job |
 | `POST /jobs?name=<name>` | Upload a program; the body is the G-code text. Returns `201` |
 | `GET /jobs` | List jobs, oldest first |
@@ -178,6 +179,29 @@ The server will not resume until you have dealt with the alarm.
 - Line noise and unrecognised output are ignored. Acknowledgements left
   over from an earlier session are discarded while the controller is
   identified, so they cannot be mistaken for the new session's replies.
+
+### Live events
+
+`GET /events` is a server-sent event stream, so a client can follow a job
+without polling.
+
+```sh
+curl -N localhost:8080/events
+```
+
+- `event: machine` carries the same JSON as `GET /machine`: connection,
+  controller state, positions, alarm, and the active job.
+- `event: job` carries a job record, as in `GET /jobs/{id}`. It is sent when
+  the active job changes (progress, pause, resume) and once more with the
+  final record when the job ends, whether it completed, stopped, failed or
+  was interrupted. The job event comes before the machine event it explains.
+
+The stream opens with the current state, so a client that reconnects has
+nothing to catch up on. Events are sent only when something changed, and
+changes within 100 ms are folded into one carrying the latest state, so a
+slow client sees the current picture rather than a backlog; it is not a log
+of every transition. Idle machines are quiet apart from keep-alive
+comments. Ctrl-C ends open streams so the server can exit.
 
 ### Jogging
 
