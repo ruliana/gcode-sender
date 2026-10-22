@@ -66,6 +66,10 @@ pub struct JobRecord {
     /// resumed after an interruption.
     #[serde(default)]
     pub resumed_from_line: Option<usize>,
+    /// The G54 work offset (machine coordinates) the job last ran with, so
+    /// a resume can tell that the work zero has moved since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_offset: Option<[f64; 3]>,
     /// Why the job paused, failed or was interrupted.
     pub reason: Option<String>,
     pub line_errors: Vec<LineError>,
@@ -135,6 +139,7 @@ impl JobStore {
             started_at_ms: None,
             finished_at_ms: None,
             resumed_from_line: None,
+            work_offset: None,
             reason: None,
             line_errors: Vec::new(),
         };

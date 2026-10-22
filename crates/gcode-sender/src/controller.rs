@@ -100,6 +100,7 @@ enum Command {
     Delete(String, Reply<()>),
     Machine(MachineAction, Reply<()>),
     Jog(JogRequest, Reply<()>),
+    Work(WorkChange, AxisValues, Reply<()>),
 }
 
 /// What to do differently when resuming a job that is not active.
@@ -111,6 +112,10 @@ pub struct ResumeOptions {
     pub from_line: Option<usize>,
     /// Lift the tool before moving back to the work.
     pub retract: Option<Retract>,
+    /// Resume even though the work zero (G54) is not where it was when the
+    /// job last ran, which moves the whole cut.
+    #[serde(default)]
+    pub accept_moved_zero: bool,
 }
 
 /// Lift the tool, travel above the resume point, and plunge back to it.
@@ -139,6 +144,23 @@ pub enum MachineAction {
     Reset,
     /// Realtime jog cancel: stop a jog in progress and drop the queued ones.
     JogCancel,
+}
+
+/// One number per axis; axes left out are not touched.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AxisValues {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub z: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkChange {
+    /// `G10 L20`: the tool is here, and here has these work coordinates.
+    Zero,
+    /// `G10 L2`: work coordinates start at these machine coordinates.
+    Offset,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -219,6 +241,10 @@ impl ControllerHandle {
     pub async fn machine(&self, action: MachineAction) -> Result<(), ControlError> {
         self.call(|r| Command::Machine(action, r)).await
     }
+    /// Resolves once the controller has accepted or refused the change.
+    pub async fn work(&self, change: WorkChange, values: AxisValues) -> Result<(), ControlError> {
+        self.call(|r| Command::Work(change, values, r)).await
+    }
     /// Resolves once the controller has accepted or refused the jog.
     pub async fn jog(&self, request: JogRequest) -> Result<(), ControlError> {
         self.call(|r| Command::Jog(request, r)).await
@@ -288,6 +314,8 @@ enum Origin {
     Internal,
     /// A `$J=` jog; the caller waits for the controller's answer.
     Jog,
+    /// A `G10` that sets the work zero; the caller waits for the answer.
+    Work,
 }
 
 struct InFlight {
@@ -445,7 +473,7 @@ impl Actor {
             Command::Delete(id, r) => {
                 let _ = r.send(self.delete(&id));
             }
-            Command::Machine(_, r) | Command::Jog(_, r) => {
+            Command::Machine(_, r) | Command::Jog(_, r) | Command::Work(_, _, r) => {
                 let _ = r.send(Err(ControlError::Unavailable(
                     "the machine is not connected".into(),
                 )));
@@ -784,6 +812,31 @@ impl Actor {
                     });
                 }
             }
+            Origin::Work => {
+                if let Some(reply) = done.reply {
+                    let _ = reply.send(match error {
+                        None => {
+                            // The controller reports the new offset on its
+                            // next status; until then the old one is wrong.
+                            if let Some(st) = &mut self.machine.status {
+                                st.work_offset = None;
+                                st.work_position = None;
+                            }
+                            Ok(())
+                        }
+                        Some(code) => {
+                            let message = format!(
+                                "the controller rejected the change: error {code}, {}",
+                                grbl::error_message(code)
+                            );
+                            Err(match code {
+                                8 | 9 => ControlError::Conflict(message),
+                                _ => ControlError::Invalid(message),
+                            })
+                        }
+                    });
+                }
+            }
             Origin::Preamble => {
                 if let Some(code) = error {
                     // Without the right modal state, continuing would cut
@@ -864,6 +917,7 @@ impl Actor {
                 let _ = reply.send(result);
             }
             Command::Jog(request, reply) => self.jog(s, request, reply).await?,
+            Command::Work(change, values, reply) => self.work(s, change, values, reply).await?,
             Command::Resume(id, options, reply) => {
                 let mut result = self.check_active(&id, &[JobState::Paused]);
                 if result.is_ok() && (options.from_line.is_some() || options.retract.is_some()) {
@@ -922,6 +976,7 @@ impl Actor {
         record.started_at_ms = Some(now_ms());
         record.finished_at_ms = None;
         record.resumed_from_line = None;
+        record.work_offset = self.known_position().1;
         record.reason = None;
         record.line_errors.clear();
         self.store.save(&record)?;
@@ -1008,6 +1063,15 @@ impl Actor {
         self.check_ready()?;
         let lines = self.store.program(id)?;
         self.check_program(s, &lines)?;
+        if let (Some(then), (_, Some(now))) = (record.work_offset, self.known_position())
+            && then.iter().zip(now).any(|(a, b)| (a - b).abs() > 1e-3)
+            && !options.accept_moved_zero
+        {
+            return Err(ControlError::Conflict(format!(
+                "the work zero (G54) has moved since this job last ran: it was at machine X{:.3} Y{:.3} Z{:.3} and is now at X{:.3} Y{:.3} Z{:.3}, so resuming would cut in a different place; put the zero back, or set accept_moved_zero to resume anyway",
+                then[0], then[1], then[2], now[0], now[1], now[2]
+            )));
+        }
 
         let index = match options.from_line {
             Some(from) => lines.iter().position(|l| l.number >= from).ok_or_else(|| {
@@ -1054,6 +1118,7 @@ impl Actor {
         record.acked_lines = index;
         record.last_acked_line = index.checked_sub(1).map(|i| lines[i].number);
         record.resumed_from_line = Some(lines[index].number);
+        record.work_offset = self.known_position().1.or(record.work_offset);
         record.finished_at_ms = None;
         record.reason = None;
         self.store.save(&record)?;
@@ -1290,6 +1355,80 @@ impl Actor {
             end
         });
         Ok((line, end))
+    }
+
+    /// Sets the G54 work zero with `G10`. It needs the machine at rest,
+    /// because `L20` takes the position the tool is at now.
+    async fn work(
+        &mut self,
+        s: &mut Session,
+        change: WorkChange,
+        values: AxisValues,
+        reply: Reply<()>,
+    ) -> std::io::Result<()> {
+        let line = match self.plan_work(s, change, values) {
+            Ok(line) => line,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return Ok(());
+            }
+        };
+        self.machine.last_error = None;
+        let bytes = line.len() + 1;
+        if s.inflight.is_empty() {
+            s.last_ack = Instant::now();
+        }
+        s.writer.write_all(format!("{line}\n").as_bytes()).await?;
+        s.inflight.push_back(InFlight {
+            origin: Origin::Work,
+            bytes,
+            reply: Some(reply),
+        });
+        s.inflight_bytes += bytes;
+        Ok(())
+    }
+
+    fn plan_work(
+        &self,
+        s: &Session,
+        change: WorkChange,
+        values: AxisValues,
+    ) -> Result<String, ControlError> {
+        self.check_ready()?;
+        if s.awaiting_reset.is_some() {
+            return Err(ControlError::Unavailable(
+                "the controller is resetting".into(),
+            ));
+        }
+        if self.machine.status.is_none() {
+            return Err(ControlError::Unavailable(
+                "the machine state has not been reported yet".into(),
+            ));
+        }
+        let axes = [values.x, values.y, values.z];
+        if axes.iter().all(Option::is_none) {
+            return Err(ControlError::Invalid(
+                "give at least one of x, y or z".into(),
+            ));
+        }
+        if axes.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(ControlError::Invalid("x, y and z must be numbers".into()));
+        }
+        let mut line = format!(
+            "G21 G90 G10 L{} P1",
+            if change == WorkChange::Zero { 20 } else { 2 }
+        );
+        for (name, v) in ["X", "Y", "Z"].iter().zip(axes) {
+            if let Some(v) = v {
+                line.push_str(&format!(" {name}{v:.3}"));
+            }
+        }
+        if s.inflight_bytes + line.len() + 1 > self.capacity(s) {
+            return Err(ControlError::Conflict(
+                "the controller is still busy with earlier commands; try again".into(),
+            ));
+        }
+        Ok(line)
     }
 
     async fn jog(
