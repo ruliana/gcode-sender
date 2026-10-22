@@ -96,10 +96,17 @@ async fn main() -> anyhow::Result<()> {
     // Printed on stdout so scripts and tests can find the port.
     println!("listening on {addr}");
 
-    let app = http::router(http::AppState { store, controller });
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let app = http::router(http::AppState {
+        store,
+        controller,
+        shutdown,
+    });
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Event streams never end on their own.
+            let _ = stop.send(true);
         })
         .await?;
     Ok(())
