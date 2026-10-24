@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::bounds::Bounds;
 use crate::program::{self, ProgramLine};
+use crate::settings::Settings;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +37,14 @@ impl JobState {
     pub fn is_active(self) -> bool {
         matches!(self, Self::Running | Self::Paused | Self::Stopping)
     }
+}
+
+/// Where a pause stopped the tool, in machine coordinates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PausePoint {
+    pub position: [f64; 3],
+    /// The Z the tool was lifted to, if it was lifted.
+    pub lifted_to: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,6 +75,10 @@ pub struct JobRecord {
     /// resumed after an interruption.
     #[serde(default)]
     pub resumed_from_line: Option<usize>,
+    /// Where the tool was when a pause freed the machine, and where it was
+    /// lifted to. Resuming brings it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<PausePoint>,
     /// The G54 work offset (machine coordinates) the job last ran with, so
     /// a resume can tell that the work zero has moved since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +136,21 @@ impl JobStore {
         }
     }
 
+    pub fn settings(&self) -> Result<Settings> {
+        match std::fs::read(self.data_dir.join("settings.json")) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_settings(&self, settings: &Settings) -> Result<()> {
+        write_atomic(
+            &self.data_dir.join("settings.json"),
+            &serde_json::to_vec_pretty(settings)?,
+        )
+    }
+
     pub fn create(&self, name: Option<String>, source: &str) -> Result<JobRecord> {
         let id = Uuid::new_v4().to_string();
         let dir = self.root.join(&id);
@@ -139,6 +167,7 @@ impl JobStore {
             started_at_ms: None,
             finished_at_ms: None,
             resumed_from_line: None,
+            paused_at: None,
             work_offset: None,
             reason: None,
             line_errors: Vec::new(),
@@ -199,7 +228,9 @@ impl JobStore {
     pub fn recover(&self) -> Result<Vec<JobRecord>> {
         let mut recovered = Vec::new();
         for mut job in self.list()? {
-            if job.state.is_active() {
+            // A pause that freed the machine is not an interrupted job.
+            let released_pause = job.state == JobState::Paused && job.paused_at.is_some();
+            if job.state.is_active() && !released_pause {
                 job.state = JobState::Interrupted;
                 job.reason = Some("the server stopped while the job was active".into());
                 job.finished_at_ms = Some(now_ms());

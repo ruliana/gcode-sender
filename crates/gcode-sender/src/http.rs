@@ -22,6 +22,7 @@ use crate::controller::{
     AxisValues, ControlError, ControllerHandle, JogRequest, MachineAction, MachineSnapshot,
     ResumeOptions, WorkChange,
 };
+use crate::settings::{PauseOptions, Settings};
 use crate::store::{JobRecord, JobStore};
 
 #[derive(Clone)]
@@ -44,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/machine/work-offset", put(work_offset))
         .route("/machine/jog", post(jog))
         .route("/machine/jog/cancel", post(jog_cancel))
+        .route("/settings", get(get_settings).put(put_settings))
         .route(
             "/machine/bounds",
             get(get_bounds).put(put_bounds).delete(delete_bounds),
@@ -172,8 +174,13 @@ async fn start_job(
 async fn pause_job(
     State(app): State<AppState>,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> ApiResult<(StatusCode, Json<JobRecord>)> {
-    Ok((StatusCode::ACCEPTED, Json(app.controller.pause(id).await?)))
+    let options = parse_json::<PauseOptions>(&body)?.unwrap_or_default();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(app.controller.pause(id, options).await?),
+    ))
 }
 
 async fn resume_job(
@@ -262,6 +269,24 @@ async fn jog_cancel(
     State(app): State<AppState>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     machine_action(app, MachineAction::JogCancel).await
+}
+
+async fn get_settings(State(app): State<AppState>) -> ApiResult<Json<Settings>> {
+    Ok(Json(app.store.settings()?))
+}
+
+async fn put_settings(State(app): State<AppState>, body: Bytes) -> ApiResult<Json<Settings>> {
+    let settings = parse_json::<Settings>(&body)?.ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a JSON body is required".into(),
+        )
+    })?;
+    settings
+        .validate()
+        .map_err(|m| ApiError(StatusCode::UNPROCESSABLE_ENTITY, m))?;
+    app.store.set_settings(&settings)?;
+    Ok(Json(settings))
 }
 
 async fn get_bounds(State(app): State<AppState>) -> ApiResult<Json<Bounds>> {

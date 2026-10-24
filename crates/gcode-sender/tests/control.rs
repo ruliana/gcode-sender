@@ -27,7 +27,7 @@ async fn pause_holds_machine_and_stops_sending() {
     let h = Harness::start(slow()).await;
     let id = running_job(&h, 300).await;
 
-    let job = h.action(&id, "pause").await;
+    let job = h.hold(&id).await;
     assert_eq!(job["state"], "paused");
     h.wait_machine("the hold to settle", |m| {
         m["status"]["state"] == "Hold" && m["status"]["substate"] == 0
@@ -51,7 +51,7 @@ async fn pause_holds_machine_and_stops_sending() {
 async fn resume_continues_to_completion() {
     let h = Harness::start(slow()).await;
     let id = running_job(&h, 100).await;
-    h.action(&id, "pause").await;
+    h.hold(&id).await;
     h.wait_machine("the hold to settle", |m| m["status"]["substate"] == 0)
         .await;
 
@@ -69,7 +69,7 @@ async fn resume_right_after_pause_is_not_lost() {
     // sender has to wait for the hold to settle before sending it.
     let h = Harness::start(slow()).await;
     let id = running_job(&h, 60).await;
-    h.action(&id, "pause").await;
+    h.hold(&id).await;
     h.action(&id, "resume").await;
     h.wait_job_state(&id, "completed").await;
 }
@@ -79,7 +79,7 @@ async fn pause_and_resume_many_times() {
     let h = Harness::start(slow()).await;
     let id = running_job(&h, 150).await;
     for _ in 0..5 {
-        h.action(&id, "pause").await;
+        h.hold(&id).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
         h.action(&id, "resume").await;
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -142,7 +142,7 @@ async fn stop_halts_without_losing_position() {
 async fn stop_while_paused() {
     let h = Harness::start(slow()).await;
     let id = running_job(&h, 300).await;
-    h.action(&id, "pause").await;
+    h.hold(&id).await;
     h.wait_machine("the hold to settle", |m| m["status"]["substate"] == 0)
         .await;
     h.action(&id, "stop").await;
@@ -184,7 +184,7 @@ async fn control_actions_check_job_state() {
     let id = running_job(&h, 300).await;
     let (status, _) = h.post(&format!("/jobs/{id}/resume")).await;
     assert_eq!(status, StatusCode::CONFLICT, "resume while running");
-    h.action(&id, "pause").await;
+    h.hold(&id).await;
     let (status, _) = h.post(&format!("/jobs/{id}/pause")).await;
     assert_eq!(status, StatusCode::CONFLICT, "pause while paused");
     h.action(&id, "stop").await;
