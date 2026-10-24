@@ -226,6 +226,18 @@ impl Harness {
         job
     }
 
+    /// Pauses with a plain feed hold, leaving the tool where it is.
+    pub async fn hold(&self, id: &str) -> Value {
+        let (status, job) = self
+            .post_json(
+                &format!("/jobs/{id}/pause"),
+                &serde_json::json!({"lift": false}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "hold failed: {job}");
+        job
+    }
+
     pub async fn wait_job(&self, id: &str, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
         wait_for(what, || async {
             let job = self.job(id).await;

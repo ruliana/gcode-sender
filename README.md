@@ -60,8 +60,8 @@ identified yet.
 | `GET /jobs/{id}` | One job, with live progress while it runs |
 | `DELETE /jobs/{id}` | Delete a job that is not active |
 | `POST /jobs/{id}/start` | Start streaming. Also re-runs a finished job from the top |
-| `POST /jobs/{id}/pause` | Feed hold, and stop sending lines |
-| `POST /jobs/{id}/resume` | Cycle start once the hold has settled, and keep sending. Also continues an `interrupted`, `stopped` or `failed` job, with options; see below |
+| `POST /jobs/{id}/pause` | Stop the machine, lift the tool and free the machine for jogging; see below. A body of `{"lift": false}` makes it a plain feed hold |
+| `POST /jobs/{id}/resume` | Bring the tool back and continue, or, after a plain hold, cycle start. Also continues an `interrupted`, `stopped` or `failed` job, with options; see below |
 | `POST /jobs/{id}/stop` | Feed hold, then soft reset once the machine is at rest |
 
 | `POST /machine/unlock` | `$X`: clear an alarm lock |
@@ -71,6 +71,8 @@ identified yet.
 | `PUT /machine/work-offset` | Set where work zero is in machine coordinates, see below |
 | `POST /machine/jog` | Move the tool by hand, see below |
 | `POST /machine/jog/cancel` | Stop a jog in progress and drop the queued ones |
+| `GET /settings` | The sender's settings, see below |
+| `PUT /settings` | Replace the settings |
 | `GET /machine/bounds` | The machine boundaries, see below |
 | `PUT /machine/bounds` | Set the boundaries |
 | `DELETE /machine/bounds` | Remove the boundaries |
@@ -109,6 +111,68 @@ curl -s localhost:8080/jobs/$id | jq '{state, acked_lines, total_lines}'
 - **State on disk.** Jobs live under `--data-dir` as the uploaded program
   plus a JSON record written with an atomic rename. Progress is saved
   every 250 ms while running.
+
+### Pausing and resuming
+
+By default a pause moves the tool out of the way, so the machine is free
+to be moved by hand and the job can be resumed from the same place.
+
+1. The server sends a feed hold and waits for the machine to stop.
+2. It records the tool's position and soft-resets the controller, which
+   throws away what was queued and stops the spindle.
+3. It lifts the tool by `pause.height` (10 mm by default) with a jog, never
+   past the Z boundary, or to `pause.z` if that is set. A jog is used because
+   the controller refuses one that would leave its travel, where a plain move
+   raises an alarm.
+4. The job is released: it stays `paused`, with `paused_at` giving the
+   position (`position`) and the Z it was lifted to (`lifted_to`), and the
+   machine is free again. Jog, change the work zero, or just wait.
+
+`POST /jobs/{id}/resume` then brings the tool back whatever happened in
+between: it rises to a safe Z (the height it was lifted to, or higher), travels
+over the point where the program picks up, restarts the spindle and coolant
+if the program had them on, waits `pause.dwell_s` seconds for the spindle to
+reach speed, plunges at the program's feed rate, and carries on. The
+program is picked up a few lines before where it stopped (up to the
+controller's planner depth plus one, the same as resuming after a dropped
+connection), so those lines are cut again over the same path. A pause that
+is still lifting answers `409` to a resume; try again in a moment.
+
+Things to know:
+
+- **The spindle stops** at the reset, before the lift. Pass
+  `{"lift": false}` for a pause that keeps it running.
+- If the controller refuses the lift (it is at the top of its travel, say) or
+  the tool is already as high as the Z boundary allows, the job is still
+  paused and released, with `lifted_to` null and the reason saying why. If
+  the program cannot be picked up again (it uses `G92`, `G10`, `G28`, `G30`,
+  another work offset, or is in `G91` there), the pause is a plain feed
+  hold, and the reason says so.
+- `POST /jobs/{id}/stop` on a released pause just retires the job. A
+  released pause survives a server restart; moving the work zero in
+  between is caught, as for any resume (`accept_moved_zero`).
+- Giving `retract` to `resume` overrides the automatic return.
+- A line the controller rejects still holds the machine in place, without
+  lifting, since something is wrong and the operator should look first.
+
+The behaviour is a setting, on by default:
+
+```sh
+curl localhost:8080/settings
+# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0}}
+
+# A pause is a plain feed hold; resume is a cycle start.
+curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
+  -d '{"pause": {"lift": false}}'
+
+# Or per pause:
+curl -X POST localhost:8080/jobs/$id/pause -H 'content-type: application/json' \
+  -d '{"height": 25}'
+```
+
+`PUT /settings` replaces the whole document, so leave out what should stay at
+its default. They are kept in `settings.json` in the data directory.
+`dwell_s` has to stay below `--ack-timeout-ms`.
 
 ### Interrupted jobs and resuming
 
@@ -155,7 +219,7 @@ curl -X POST localhost:8080/jobs/$id/resume -H 'content-type: application/json' 
   mistake, and if it is outside a Z boundary.
 - `from_line` is a file line number. A comment or blank line means the next
   line of code, and `0` means the top of the program.
-- Neither option applies to a paused job; plain `resume` continues those.
+- Neither option applies to a job paused by a plain feed hold; plain `resume` continues those.
 
 Repeating absolute moves is harmless; repeating incremental ones is not.
 A program in `G91` at the resume point is refused with `422`, as is one

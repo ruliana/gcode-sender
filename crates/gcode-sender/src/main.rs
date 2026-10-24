@@ -4,6 +4,7 @@ mod gcode;
 mod grbl;
 mod http;
 mod program;
+mod settings;
 mod store;
 
 use std::path::PathBuf;

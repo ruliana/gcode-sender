@@ -332,7 +332,7 @@ async fn machine_actions_are_refused_during_a_job() {
 async fn reset_clears_a_hold_left_by_an_earlier_session() {
     let mut h = Harness::start(slow()).await;
     let id = running_past(&h, 100, 40).await;
-    h.action(&id, "pause").await;
+    h.hold(&id).await;
     h.wait_machine("the hold", |m| m["status"]["substate"] == 0)
         .await;
     tokio::time::sleep(Duration::from_millis(400)).await;

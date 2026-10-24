@@ -326,7 +326,7 @@ async fn options_do_not_apply_to_a_paused_job() {
     let id = h.run(&text).await;
     h.wait_job(&id, "progress", |j| j["acked_lines"].as_u64() > Some(20))
         .await;
-    h.action(&id, "pause").await;
+    h.hold(&id).await;
     let (status, reply) = resume(&h, &id, json!({"from_line": 10})).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reply}");
     assert_eq!(h.job(&id).await["state"], "paused");

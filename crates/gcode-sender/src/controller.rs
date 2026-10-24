@@ -24,7 +24,8 @@ use crate::bounds::{self, Bounds};
 use crate::gcode::{Interpreter, Modal};
 use crate::grbl::{self, FirmwareKind, Response, Status, realtime};
 use crate::program::ProgramLine;
-use crate::store::{JobRecord, JobState, JobStore, LineError, now_ms};
+use crate::settings::{PauseOptions, PauseSettings};
+use crate::store::{JobRecord, JobState, JobStore, LineError, PausePoint, now_ms};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -94,7 +95,7 @@ type Reply<T> = oneshot::Sender<Result<T, ControlError>>;
 
 enum Command {
     Start(String, Reply<JobRecord>),
-    Pause(String, Reply<JobRecord>),
+    Pause(String, PauseOptions, Reply<JobRecord>),
     Resume(String, ResumeOptions, Reply<JobRecord>),
     Stop(String, Reply<JobRecord>),
     Delete(String, Reply<()>),
@@ -227,8 +228,12 @@ impl ControllerHandle {
     pub async fn start(&self, id: String) -> Result<JobRecord, ControlError> {
         self.call(|r| Command::Start(id, r)).await
     }
-    pub async fn pause(&self, id: String) -> Result<JobRecord, ControlError> {
-        self.call(|r| Command::Pause(id, r)).await
+    pub async fn pause(
+        &self,
+        id: String,
+        options: PauseOptions,
+    ) -> Result<JobRecord, ControlError> {
+        self.call(|r| Command::Pause(id, options, r)).await
     }
     pub async fn resume(
         &self,
@@ -321,6 +326,8 @@ enum Origin {
     Jog,
     /// A `G10` that sets the work zero; the caller waits for the answer.
     Work,
+    /// The jog that lifts the tool when a pause frees the machine.
+    Lift,
 }
 
 struct InFlight {
@@ -353,8 +360,24 @@ struct ActiveJob {
     /// A resume was requested; cycle start is sent once the hold has
     /// settled, because the controller ignores it while decelerating.
     resume_pending: bool,
+    /// Set while a pause is stopping the machine and lifting the tool, after
+    /// which the job is released and the machine is free to be moved.
+    lift_pause: Option<LiftPause>,
     dirty: bool,
     last_saved: Instant,
+}
+
+struct LiftPause {
+    settings: PauseSettings,
+    /// Where the tool stopped, in machine coordinates.
+    position: Option<[f64; 3]>,
+    /// The lift jog has been sent.
+    lifting: bool,
+    /// The controller accepted the lift jog; the pause ends when it is done.
+    lift_acked: bool,
+    lifted_to: Option<f64>,
+    /// Why the tool was not lifted, if it was not.
+    note: Option<String>,
 }
 
 impl ActiveJob {
@@ -414,6 +437,10 @@ const DEFAULT_PLANNER_BLOCKS: usize = 16;
 const INFO_RETRY: Duration = Duration::from_secs(1);
 const RESET_TIMEOUT: Duration = Duration::from_secs(3);
 const SAVE_INTERVAL: Duration = Duration::from_millis(250);
+/// Feed for the lift jog. The controller caps it at the axis's maximum rate.
+const LIFT_FEED: f64 = 2000.0;
+/// Plunge feed on resume when the program has no plain feed rate to use.
+const FALLBACK_PLUNGE_FEED: f64 = 300.0;
 
 impl Actor {
     async fn run(mut self) {
@@ -472,8 +499,11 @@ impl Actor {
                     "the machine is not connected".into(),
                 )));
             }
-            Command::Pause(id, r) | Command::Resume(id, _, r) | Command::Stop(id, r) => {
+            Command::Pause(id, _, r) | Command::Resume(id, _, r) => {
                 let _ = r.send(self.inactive_error(&id));
+            }
+            Command::Stop(id, r) => {
+                let _ = r.send(self.stop_released(&id));
             }
             Command::Delete(id, r) => {
                 let _ = r.send(self.delete(&id));
@@ -486,7 +516,8 @@ impl Actor {
         }
     }
 
-    /// A job that ended before it finished and can be continued.
+    /// A job that ended before it finished and can be continued, or one
+    /// whose pause freed the machine.
     fn is_resumable(&self, id: &str) -> bool {
         self.job.is_none()
             && matches!(
@@ -494,8 +525,26 @@ impl Actor {
                 Ok(Some(j)) if matches!(
                     j.state,
                     JobState::Interrupted | JobState::Stopped | JobState::Failed
-                )
+                ) || j.state == JobState::Paused && j.paused_at.is_some()
             )
+    }
+
+    /// Stopping a paused job that already freed the machine only has to
+    /// retire the job, since there is nothing running.
+    fn stop_released(&mut self, id: &str) -> Result<JobRecord, ControlError> {
+        if self.job.is_none()
+            && let Some(mut record) = self.store.get(id)?
+            && record.state == JobState::Paused
+            && record.paused_at.is_some()
+        {
+            record.state = JobState::Stopped;
+            record.reason = Some("stopped on request".into());
+            record.paused_at = None;
+            record.finished_at_ms = Some(now_ms());
+            self.store.save(&record)?;
+            return Ok(record);
+        }
+        self.inactive_error(id)
     }
 
     fn inactive_error(&self, id: &str) -> Result<JobRecord, ControlError> {
@@ -625,7 +674,7 @@ impl Actor {
             && sent.elapsed() > RESET_TIMEOUT
         {
             warn!("no banner after soft reset");
-            self.after_reset(s);
+            self.after_reset(s).await?;
         }
 
         let stop_overdue = self
@@ -675,7 +724,7 @@ impl Actor {
                 };
                 self.machine.ready = false;
                 if s.awaiting_reset.is_some() {
-                    self.after_reset(s);
+                    self.after_reset(s).await?;
                 } else {
                     clear_inflight(s);
                     self.jog_target = None;
@@ -746,12 +795,22 @@ impl Actor {
         }
         if job.stop_requested.is_some() {
             if s.awaiting_reset.is_none() && (status.hold_complete() || status.state == "Idle") {
+                if let Some(lift) = &mut job.lift_pause {
+                    lift.position
+                        .get_or_insert_with(|| machine_position(status).unwrap_or_default());
+                }
                 self.soft_reset(s).await?;
             }
         } else if job.record.state == JobState::Running && job.all_acked() && status.state == "Idle"
         {
             // Every line is in the planner and the machine has come to rest.
             self.finish_job(JobState::Completed, None);
+        } else if job
+            .lift_pause
+            .as_ref()
+            .is_some_and(|l| l.lift_acked && status.state == "Idle")
+        {
+            self.release_paused(None);
         }
         Ok(())
     }
@@ -815,6 +874,21 @@ impl Actor {
                             })
                         }
                     });
+                }
+            }
+            Origin::Lift => {
+                if let Some(lift) = self.job.as_mut().and_then(|j| j.lift_pause.as_mut()) {
+                    match error {
+                        None => lift.lift_acked = true,
+                        Some(code) => {
+                            lift.lifted_to = None;
+                            lift.note = Some(format!(
+                                "the controller refused the lift: error {code}, {}",
+                                grbl::error_message(code)
+                            ));
+                            self.release_paused(None);
+                        }
+                    }
                 }
             }
             Origin::Work => {
@@ -898,14 +972,43 @@ impl Actor {
                     self.pump(s).await?;
                 }
             }
-            Command::Pause(id, reply) => {
-                let result = self.check_active(&id, &[JobState::Running]);
+            Command::Pause(id, options, reply) => {
+                let mut result = self.check_active(&id, &[JobState::Running]);
+                let mut lift = None;
+                let mut skipped = None;
+                if result.is_ok() {
+                    match self.plan_lift(s, &options) {
+                        Ok((settings, why)) => (lift, skipped) = (settings, why),
+                        Err(e) => result = Err(e),
+                    }
+                }
                 if result.is_ok() {
                     s.writer.write_all(&[realtime::FEED_HOLD]).await?;
                     if let Some(job) = &mut self.job {
                         job.resume_pending = false;
+                        if let Some(settings) = lift {
+                            // The hold settles, a reset clears the planner,
+                            // and then the tool is lifted.
+                            job.stop_requested = Some(Instant::now());
+                            job.lift_pause = Some(LiftPause {
+                                settings,
+                                position: None,
+                                lifting: false,
+                                lift_acked: false,
+                                lifted_to: None,
+                                note: None,
+                            });
+                        }
                     }
-                    self.transition(JobState::Paused, Some("paused on request".into()));
+                    let reason = match (&lift_planned(&self.job), skipped) {
+                        (true, _) => "pausing: bringing the machine to rest, then lifting the tool"
+                            .to_string(),
+                        (false, Some(why)) => {
+                            format!("paused on request; the tool was not lifted: {why}")
+                        }
+                        (false, None) => "paused on request".to_string(),
+                    };
+                    self.transition(JobState::Paused, Some(reason));
                 }
                 let _ = reply.send(result.map(|_| self.active_record()));
             }
@@ -925,6 +1028,12 @@ impl Actor {
             Command::Work(change, values, reply) => self.work(s, change, values, reply).await?,
             Command::Resume(id, options, reply) => {
                 let mut result = self.check_active(&id, &[JobState::Paused]);
+                if result.is_ok() && self.job.as_ref().is_some_and(|j| j.lift_pause.is_some()) {
+                    result = Err(ControlError::Conflict(
+                        "the pause is still bringing the machine to rest and lifting the tool; try again in a moment"
+                            .into(),
+                    ));
+                }
                 if result.is_ok() && (options.from_line.is_some() || options.retract.is_some()) {
                     result = Err(ControlError::Invalid(
                         "from_line and retract only apply to a job that is not active".into(),
@@ -939,11 +1048,16 @@ impl Actor {
                 let _ = reply.send(result.map(|_| self.active_record()));
                 self.pump(s).await?;
             }
+            Command::Stop(id, reply) if !self.job.as_ref().is_some_and(|j| j.record.id == id) => {
+                let _ = reply.send(self.stop_released(&id));
+            }
             Command::Stop(id, reply) => {
                 let result = self.check_active(&id, &[JobState::Running, JobState::Paused]);
                 if result.is_ok() {
                     if let Some(job) = &mut self.job {
                         job.resume_pending = false;
+                        // A stop outranks a pause that is still lifting.
+                        job.lift_pause = None;
                     }
                     // Hold first so the machine decelerates instead of
                     // losing position; the reset follows on Hold:0.
@@ -960,6 +1074,50 @@ impl Actor {
             }
         }
         Ok(())
+    }
+
+    /// Decides whether a pause lifts the tool. Returns the settings to lift
+    /// with, or, when the pause has to be a plain hold, why.
+    fn plan_lift(
+        &self,
+        s: &Session,
+        options: &PauseOptions,
+    ) -> Result<(Option<PauseSettings>, Option<String>), ControlError> {
+        let settings = options
+            .apply(&self.store.settings()?.pause)
+            .map_err(ControlError::Invalid)?;
+        if !settings.lift {
+            return Ok((None, None));
+        }
+        let Some(job) = &self.job else {
+            return Ok((None, None));
+        };
+        // The reset that clears the planner forgets the program's state, so
+        // the job has to be one that can be picked up again.
+        let index = job
+            .record
+            .acked_lines
+            .saturating_sub(s.planner_blocks + 1)
+            .min(job.lines.len().saturating_sub(1));
+        let mut machine = Interpreter::new([0.0; 3], [0.0; 3]);
+        for line in &job.lines[..index] {
+            if let Err(e) = machine.step(&line.text) {
+                return Ok((
+                    None,
+                    Some(format!(
+                        "line {} uses {}, so the job could not be picked up again",
+                        line.number, e.0
+                    )),
+                ));
+            }
+        }
+        if !machine.modal.absolute {
+            return Ok((
+                None,
+                Some("the program is in incremental mode (G91), so the job could not be picked up again".into()),
+            ));
+        }
+        Ok((Some(settings), None))
     }
 
     fn start(&mut self, s: &Session, id: &str) -> Result<JobRecord, ControlError> {
@@ -981,6 +1139,7 @@ impl Actor {
         record.started_at_ms = Some(now_ms());
         record.finished_at_ms = None;
         record.resumed_from_line = None;
+        record.paused_at = None;
         record.work_offset = self.known_position().1;
         record.reason = None;
         record.line_errors.clear();
@@ -993,6 +1152,7 @@ impl Actor {
             preamble: VecDeque::new(),
             stop_requested: None,
             resume_pending: false,
+            lift_pause: None,
             dirty: false,
             last_saved: Instant::now(),
         });
@@ -1106,7 +1266,39 @@ impl Actor {
             )));
         }
 
-        let preamble = match &options.retract {
+        // A pause that freed the machine promised to put the tool back.
+        let auto_return = options.retract.is_none()
+            && record.state == JobState::Paused
+            && record.paused_at.is_some();
+        let retract = match (&options.retract, &record.paused_at) {
+            (Some(retract), _) => Some(retract.clone()),
+            (None, Some(point)) if auto_return => {
+                let Some(position) = position else {
+                    return Err(ControlError::Unavailable(
+                        "the machine position has not been reported yet; try again".into(),
+                    ));
+                };
+                let settings = self.store.settings()?.pause;
+                let z = [
+                    point.lifted_to.unwrap_or(point.position[2]),
+                    position[2],
+                    machine.position[2],
+                ]
+                .into_iter()
+                .fold(f64::MIN, f64::max);
+                Some(Retract {
+                    z,
+                    plunge_feed: machine
+                        .modal
+                        .feed_mm_per_min()
+                        .is_none_or(|f| f <= 0.0)
+                        .then_some(FALLBACK_PLUNGE_FEED),
+                    dwell_s: (!machine.modal.tool_lines().is_empty()).then_some(settings.dwell_s),
+                })
+            }
+            _ => None,
+        };
+        let preamble = match &retract {
             None => machine.modal.preamble(),
             Some(retract) => {
                 let (Some(position), Some(_)) = (position, offset) else {
@@ -1123,11 +1315,12 @@ impl Actor {
         record.acked_lines = index;
         record.last_acked_line = index.checked_sub(1).map(|i| lines[i].number);
         record.resumed_from_line = Some(lines[index].number);
+        record.paused_at = None;
         record.work_offset = self.known_position().1.or(record.work_offset);
         record.finished_at_ms = None;
         record.reason = None;
         self.store.save(&record)?;
-        info!(id = %record.id, from = lines[index].number, retract = options.retract.is_some(), "job resumed");
+        info!(id = %record.id, from = lines[index].number, retract = retract.is_some(), "job resumed");
         self.job = Some(ActiveJob {
             record: record.clone(),
             lines,
@@ -1135,6 +1328,7 @@ impl Actor {
             preamble: preamble.into(),
             stop_requested: None,
             resume_pending: false,
+            lift_pause: None,
             dirty: false,
             last_saved: Instant::now(),
         });
@@ -1586,18 +1780,110 @@ impl Actor {
     }
 
     /// The controller has reset after a stop: nothing sent before survives.
-    fn after_reset(&mut self, s: &mut Session) {
+    async fn after_reset(&mut self, s: &mut Session) -> std::io::Result<()> {
         s.awaiting_reset = None;
         clear_inflight(s);
         self.jog_target = None;
         s.info.next_at = None;
-        if self
-            .job
-            .as_ref()
-            .is_some_and(|j| j.stop_requested.is_some())
-        {
-            self.finish_job(JobState::Stopped, Some("stopped on request".into()));
+        let Some(job) = &mut self.job else {
+            return Ok(());
+        };
+        if job.stop_requested.is_none() {
+            return Ok(());
         }
+        if job.lift_pause.is_some() {
+            // The reset is done, so the machine no longer needs bringing
+            // to rest; what is left is the lift.
+            job.stop_requested = None;
+            self.begin_lift(s).await
+        } else {
+            self.finish_job(JobState::Stopped, Some("stopped on request".into()));
+            Ok(())
+        }
+    }
+
+    /// Where a pause should lift the tool to, or why it cannot.
+    fn lift_target(&self, lift: &LiftPause) -> Result<Option<f64>, String> {
+        let Some(position) = lift.position else {
+            return Err("the tool's position was not known".into());
+        };
+        let mut z = lift
+            .settings
+            .z
+            .unwrap_or(position[2] + lift.settings.height);
+        if let Ok(Some(Bounds {
+            z: Some([_, high]), ..
+        })) = self.store.bounds()
+        {
+            z = z.min(high);
+        }
+        Ok((z > position[2] + 1e-3).then_some(z))
+    }
+
+    /// Lifts the tool after the reset that followed a pause, or ends the
+    /// pause at once if there is nothing to lift.
+    async fn begin_lift(&mut self, s: &mut Session) -> std::io::Result<()> {
+        let Some(job) = &self.job else {
+            return Ok(());
+        };
+        let Some(lift) = &job.lift_pause else {
+            return Ok(());
+        };
+        match self.lift_target(lift) {
+            Ok(Some(z)) => {
+                // A jog is refused by the controller if it would leave the
+                // machine's travel, where a plain move raises an alarm.
+                let line = format!("$J=G21 G90 G53 Z{z:.3} F{LIFT_FEED:.3}");
+                let bytes = line.len() + 1;
+                s.writer.write_all(format!("{line}\n").as_bytes()).await?;
+                s.last_ack = Instant::now();
+                s.inflight.push_back(InFlight {
+                    origin: Origin::Lift,
+                    bytes,
+                    reply: None,
+                });
+                s.inflight_bytes += bytes;
+                if let Some(lift) = self.job.as_mut().and_then(|j| j.lift_pause.as_mut()) {
+                    lift.lifting = true;
+                    lift.lifted_to = Some(z);
+                }
+            }
+            Ok(None) => self.release_paused(Some("the tool was already as high as it can go")),
+            Err(why) => self.release_paused(Some(&why)),
+        }
+        Ok(())
+    }
+
+    /// Ends a pause that stopped the machine: the job keeps its place on
+    /// disk and the machine is free to move.
+    fn release_paused(&mut self, note: Option<&str>) {
+        let Some(job) = &mut self.job else {
+            return;
+        };
+        let Some(lift) = job.lift_pause.take() else {
+            return;
+        };
+        let position = lift
+            .position
+            .or_else(|| {
+                three(
+                    self.machine
+                        .status
+                        .as_ref()
+                        .and_then(|st| st.machine_position.as_ref()),
+                )
+            })
+            .unwrap_or_default();
+        job.record.paused_at = Some(PausePoint {
+            position,
+            lifted_to: lift.lifted_to,
+        });
+        let reason = match (lift.lifted_to, note.or(lift.note.as_deref())) {
+            (Some(_), _) => "paused on request; the tool was lifted".to_string(),
+            (None, Some(why)) => format!("paused on request; the tool was not lifted: {why}"),
+            (None, None) => "paused on request".to_string(),
+        };
+        self.finish_job(JobState::Paused, Some(reason));
     }
 
     fn transition(&mut self, state: JobState, reason: Option<String>) {
@@ -1614,7 +1900,9 @@ impl Actor {
         };
         info!(id = %job.record.id, ?state, ?reason, "job finished");
         job.record.state = state;
-        job.record.finished_at_ms = Some(now_ms());
+        if state != JobState::Paused {
+            job.record.finished_at_ms = Some(now_ms());
+        }
         if reason.is_some() {
             job.record.reason = reason;
         }
@@ -1648,6 +1936,25 @@ pub fn state_name(state: JobState) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+/// Whether a pause is lifting the tool, for the job as it stands.
+fn lift_planned(job: &Option<ActiveJob>) -> bool {
+    job.as_ref().is_some_and(|j| j.lift_pause.is_some())
+}
+
+/// The machine position of a status report, which may give the work
+/// position instead.
+fn machine_position(status: &Status) -> Option<[f64; 3]> {
+    three(status.machine_position.as_ref()).or_else(|| {
+        let work = three(status.work_position.as_ref())?;
+        let offset = three(status.work_offset.as_ref())?;
+        Some([
+            work[0] + offset[0],
+            work[1] + offset[1],
+            work[2] + offset[2],
+        ])
+    })
 }
 
 fn three(v: Option<&Vec<f64>>) -> Option<[f64; 3]> {
