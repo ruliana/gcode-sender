@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/machine/reset", post(reset))
         .route("/machine/work-zero", post(work_zero))
         .route("/machine/work-offset", put(work_offset))
+        .route("/machine/work-system", put(work_system))
         .route("/machine/jog", post(jog))
         .route("/machine/jog/cancel", post(jog_cancel))
         .route("/settings", get(get_settings).put(put_settings))
@@ -249,6 +250,13 @@ async fn work_offset(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     work_change(app, WorkChange::Offset, body).await
+}
+
+async fn work_system(
+    State(app): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    work_change(app, WorkChange::Select, body).await
 }
 
 async fn jog(

@@ -111,7 +111,10 @@ struct State {
     overflowed: bool,
     max_rx: usize,
     resets: usize,
-    work_offset: [f64; 3],
+    /// G54 to G59, in machine coordinates.
+    work_offsets: [[f64; 3]; 6],
+    /// Index into `work_offsets` of the active system.
+    system: usize,
     /// Real firmware reports the offset on the next status after it changes.
     wco_pending: bool,
     /// Soft limits: jogs past them are refused with error:15.
@@ -140,7 +143,8 @@ impl State {
             overflowed: false,
             max_rx: 0,
             resets: 0,
-            work_offset: [0.0; 3],
+            work_offsets: [[0.0; 3]; 6],
+            system: 0,
             wco_pending: false,
             travel: None,
             reports: 0,
@@ -206,7 +210,7 @@ impl State {
         // Like real firmware, the work offset rides along only on some reports.
         if self.reports.is_multiple_of(5) || self.wco_pending {
             self.wco_pending = false;
-            let [ox, oy, oz] = self.work_offset;
+            let [ox, oy, oz] = self.work_offsets[self.system];
             report.push_str(&format!("|WCO:{ox:.3},{oy:.3},{oz:.3}"));
         }
         self.reports += 1;
@@ -376,19 +380,29 @@ impl State {
                 self.ack();
             }
             "G" => {
-                self.reply("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]");
+                let system = 54 + self.system;
+                self.reply(&format!("[GC:G0 G{system} G17 G21 G90 G94 M5 M9 T0 F0 S0]"));
                 self.ack();
             }
             "#" => {
-                self.reply("[G54:0.000,0.000,0.000]");
+                let lines: Vec<String> = self
+                    .work_offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, [x, y, z])| format!("[G{}:{x:.3},{y:.3},{z:.3}]", 54 + i))
+                    .collect();
+                for line in lines {
+                    self.reply(&line);
+                }
                 self.ack();
             }
             _ => self.reply("error:3"),
         }
     }
 
-    /// `G10 L2/L20 P1`: sets the G54 work offset. `L2` takes machine
-    /// coordinates; `L20` takes the work coordinates of the current position.
+    /// `G10 L2/L20 P0..P6`: sets a work offset, P1 to P6 being G54 to G59
+    /// and P0 the active one. `L2` takes machine coordinates; `L20` takes
+    /// the work coordinates of the current position.
     fn set_offset(&mut self, line: &str) -> Result<(), u32> {
         let upper = line.to_ascii_uppercase();
         let mut chars = upper.chars().filter(|c| !c.is_whitespace()).peekable();
@@ -420,16 +434,21 @@ impl State {
         let (Some(l), Some(p)) = (l, p) else {
             return Err(28);
         };
-        if !matches!(l, 2 | 20) || !matches!(p, 0 | 1) {
+        if !matches!(l, 2 | 20) || !(0..=6).contains(&p) {
             return Err(20);
         }
         if self.moving() || self.hold != Hold::None {
             return Err(8);
         }
         self.absolute = absolute;
+        let index = if p == 0 {
+            self.system
+        } else {
+            (p - 1) as usize
+        };
         for (i, v) in axes.iter().enumerate() {
             if let Some(v) = v {
-                self.work_offset[i] = if l == 2 { *v } else { self.position[i] - v };
+                self.work_offsets[index][i] = if l == 2 { *v } else { self.position[i] - v };
             }
         }
         self.wco_pending = true;
@@ -503,7 +522,7 @@ impl State {
                 target[i] = match (absolute, machine_coords) {
                     (false, _) => base[i] + v,
                     (true, true) => *v,
-                    (true, false) => v + self.work_offset[i],
+                    (true, false) => v + self.work_offsets[self.system][i],
                 };
             }
         }
@@ -529,6 +548,8 @@ impl State {
         let mut chars = upper.chars().filter(|c| !c.is_whitespace()).peekable();
         let mut axes: [Option<f64>; 3] = [None; 3];
         let mut absolute = self.absolute;
+        let mut system = self.system;
+        let mut machine = false;
         while let Some(letter) = chars.next() {
             if !letter.is_ascii_alphabetic() {
                 return Err(2);
@@ -546,6 +567,12 @@ impl State {
             match letter {
                 'G' if value == 90.0 => absolute = true,
                 'G' if value == 91.0 => absolute = false,
+                'G' if value == 53.0 => machine = true,
+                'G' if value.fract() == 0.0 && (54.0..=59.0).contains(&value) => {
+                    system = value as usize - 54;
+                }
+                // Grbl 1.1 refuses G59.1 to G59.3 with error:29.
+                'G' if (59.0..60.0).contains(&value) => return Err(29),
                 'X' => axes[0] = Some(value),
                 'Y' => axes[1] = Some(value),
                 'Z' => axes[2] = Some(value),
@@ -553,6 +580,11 @@ impl State {
             }
         }
         self.absolute = absolute;
+        if system != self.system {
+            // Like real firmware, the new offset is reported on the next status.
+            self.wco_pending = true;
+        }
+        self.system = system;
         if axes.iter().all(Option::is_none) {
             return Ok(Block {
                 target: None,
@@ -569,9 +601,18 @@ impl State {
             .find_map(|b| b.target)
             .unwrap_or(self.position);
         let mut target = base;
+        let offset = if machine {
+            [0.0; 3]
+        } else {
+            self.work_offsets[self.system]
+        };
         for (i, axis) in axes.iter().enumerate() {
             if let Some(v) = axis {
-                target[i] = if absolute { *v } else { base[i] + v };
+                target[i] = if absolute {
+                    *v + offset[i]
+                } else {
+                    base[i] + v
+                };
             }
         }
         Ok(Block {
@@ -800,15 +841,28 @@ impl Simulator {
         self.lock().out.extend_from_slice(bytes);
     }
 
-    /// Sets the G54 work offset reported in status reports.
+    /// The active work offset, which status reports carry.
     pub fn work_offset(&self) -> [f64; 3] {
-        self.lock().work_offset
+        let s = self.lock();
+        s.work_offsets[s.system]
     }
 
+    /// Sets the active work offset.
     pub fn set_work_offset(&self, offset: [f64; 3]) {
         let mut s = self.lock();
-        s.work_offset = offset;
+        let system = s.system;
+        s.work_offsets[system] = offset;
         s.reports = 0;
+    }
+
+    /// The work offset of `system`, 54 to 59.
+    pub fn work_offset_of(&self, system: u32) -> [f64; 3] {
+        self.lock().work_offsets[system as usize - 54]
+    }
+
+    /// The active work coordinate system, 54 to 59.
+    pub fn active_system(&self) -> u32 {
+        54 + self.lock().system as u32
     }
 
     /// Soft limits in machine coordinates. A jog that would leave them is

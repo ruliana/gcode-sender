@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::bounds::Bounds;
 use crate::program::{self, ProgramLine};
 use crate::settings::Settings;
+use crate::work::WorkOffsets;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,9 +80,14 @@ pub struct JobRecord {
     /// lifted to. Resuming brings it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<PausePoint>,
-    /// The G54 work offset (machine coordinates) the job last ran with, so
-    /// a resume can tell that the work zero has moved since.
+    /// The work coordinate system the job started in, and where every zero
+    /// was when it last ran. A resume checks the systems the program uses,
+    /// so it can tell that a zero has moved since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_offsets: Option<WorkOffsets>,
+    /// Written by versions that knew only G54: its zero, in machine
+    /// coordinates. Read so an old record still gets the G54 check.
+    #[serde(default, skip_serializing)]
     pub work_offset: Option<[f64; 3]>,
     /// Why the job paused, failed or was interrupted.
     pub reason: Option<String>,
@@ -168,6 +174,7 @@ impl JobStore {
             finished_at_ms: None,
             resumed_from_line: None,
             paused_at: None,
+            work_offsets: None,
             work_offset: None,
             reason: None,
             line_errors: Vec::new(),

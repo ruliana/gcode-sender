@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::gcode::{Interpreter, Unsupported};
 use crate::program::ProgramLine;
+use crate::work::WorkOffsets;
 
 /// Allowed machine-coordinate range per axis, in millimetres. An axis left
 /// out is not checked.
@@ -57,15 +58,16 @@ const EPSILON: f64 = 1e-6;
 /// Runs the whole program from `position` and returns a message naming the
 /// first line that leaves the boundaries.
 ///
-/// `position` and `work_offset` are in machine coordinates, in millimetres,
-/// as the controller reports them.
+/// `position` is in machine coordinates, in millimetres, as the controller
+/// reports it. The program starts in the active work coordinate system of
+/// `work`, and follows any G54 to G59 it selects.
 pub fn check(
     bounds: &Bounds,
     lines: &[ProgramLine],
     position: [f64; 3],
-    work_offset: [f64; 3],
+    work: &WorkOffsets,
 ) -> Result<(), String> {
-    let mut machine = Interpreter::new(position, work_offset);
+    let mut machine = Interpreter::new(position, work.zeros, work.system);
     for line in lines {
         let extent = machine.step(&line.text).map_err(|Unsupported(what)| {
             format!(

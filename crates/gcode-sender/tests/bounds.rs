@@ -145,7 +145,7 @@ async fn boundaries_are_in_machine_coordinates() {
     // X50 in work coordinates is X150 in machine coordinates.
     let ok = h.run("G90\nG1 X50 Y20 F500\n").await;
     h.wait_job_state(&ok, "completed").await;
-    assert_eq!(h.sim.position(), [50.0, 20.0, 0.0]);
+    assert_eq!(h.sim.position(), [150.0, 70.0, 0.0]);
 
     // X150 in work coordinates is X250 in machine coordinates.
     assert_refused_after(&h, "G90\nG1 X150 F500\n", &["X to 250"]).await;
