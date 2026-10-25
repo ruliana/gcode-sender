@@ -110,7 +110,10 @@ curl -s localhost:8080/jobs/$id | jq '{state, acked_lines, total_lines}'
   and keeps its position instead of raising `ALARM:3`.
 - **State on disk.** Jobs live under `--data-dir` as the uploaded program
   plus a JSON record written with an atomic rename. Progress is saved
-  every 250 ms while running.
+  every 250 ms while running. Each rename is synced to disk, so a power cut
+  leaves the old or the new record, never a mix. A job appears only once its
+  program and record are both written, and a record that cannot be read is
+  skipped with a warning rather than stopping the server.
 
 ### Pausing and resuming
 
@@ -151,6 +154,10 @@ Things to know:
 - `POST /jobs/{id}/stop` on a released pause just retires the job. A
   released pause survives a server restart; moving the work zero in
   between is caught, as for any resume (`accept_moved_zero`).
+- If the server stops while the tool is being lifted, the job comes back
+  paused at the height it was lifting to, and resume raises the tool there.
+  The lift may or may not have finished, and the reason says so. While the
+  lift is under way the record carries that height as `lift_pending`.
 - Giving `retract` to `resume` overrides the automatic return.
 - A line the controller rejects still holds the machine in place, without
   lifting, since something is wrong and the operator should look first.

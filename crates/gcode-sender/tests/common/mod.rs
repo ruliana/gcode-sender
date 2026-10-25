@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -125,6 +125,12 @@ impl Harness {
             res,
             buf: Vec::new(),
         }
+    }
+
+    /// The directory the server keeps its state in, for tests that damage
+    /// it the way a power cut might.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Starts a new server process on the same data directory.

@@ -1058,6 +1058,7 @@ impl Actor {
                         job.resume_pending = false;
                         // A stop outranks a pause that is still lifting.
                         job.lift_pause = None;
+                        job.record.lift_pending = None;
                     }
                     // Hold first so the machine decelerates instead of
                     // losing position; the reset follows on Hold:0.
@@ -1831,6 +1832,17 @@ impl Actor {
         };
         match self.lift_target(lift) {
             Ok(Some(z)) => {
+                // Write down where the lift is headed before sending it. If
+                // the server stops mid-lift, the job is then still a paused
+                // job with a height to return the tool to, not an
+                // interrupted one with no idea where the tool is.
+                if let (Some(position), Some(job)) = (lift.position, self.job.as_mut()) {
+                    job.record.lift_pending = Some(PausePoint {
+                        position,
+                        lifted_to: Some(z),
+                    });
+                    self.save_progress(true);
+                }
                 // A jog is refused by the controller if it would leave the
                 // machine's travel, where a plain move raises an alarm.
                 let line = format!("$J=G21 G90 G53 Z{z:.3} F{LIFT_FEED:.3}");
@@ -1900,7 +1912,13 @@ impl Actor {
         };
         info!(id = %job.record.id, ?state, ?reason, "job finished");
         job.record.state = state;
+        // A lift that is not pending any more has either been released into
+        // `paused_at` or the job has ended.
+        job.record.lift_pending = None;
         if state != JobState::Paused {
+            // Only a released pause keeps a position: it is what a resume
+            // brings the tool back from.
+            job.record.paused_at = None;
             job.record.finished_at_ms = Some(now_ms());
         }
         if reason.is_some() {
