@@ -68,6 +68,7 @@ identified yet.
 | `POST /machine/home` | `$H`: run the homing cycle |
 | `POST /machine/reset` | Soft reset, for example to clear a hold left by an earlier session |
 | `POST /machine/work-zero` | Make the tool's current position a work coordinate, see below |
+| `POST /machine/position-check` | Answer whether the machine moved, see below |
 | `PUT /machine/work-offset` | Set where work zero is in machine coordinates, see below |
 | `POST /machine/jog` | Move the tool by hand, see below |
 | `POST /machine/jog/cancel` | Stop a jog in progress and drop the queued ones |
@@ -113,7 +114,8 @@ curl -s localhost:8080/jobs/$id | jq '{state, acked_lines, total_lines}'
   every 250 ms while running. Each rename is synced to disk, so a power cut
   leaves the old or the new record, never a mix. A job appears only once its
   program and record are both written, and a record that cannot be read is
-  skipped with a warning rather than stopping the server.
+  skipped with a warning rather than stopping the server. The tool's last
+  known position is kept in `position.json` the same way, see below.
 
 ### Pausing and resuming
 
@@ -166,7 +168,7 @@ The behaviour is a setting, on by default:
 
 ```sh
 curl localhost:8080/settings
-# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0}}
+# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0},"position":{"trust_record":true}}
 
 # A pause is a plain feed hold; resume is a cycle start.
 curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
@@ -237,6 +239,56 @@ jobs can still be started again from the top.
 If the controller resets while moving (an Arduino based LongBoard does when
 the USB port reopens), it raises `ALARM:3` and may have lost its position.
 The server will not resume until you have dealt with the alarm.
+
+### Where the tool is
+
+The sender is the only thing that moves the machine, so the sender keeps
+the tool's last known position in `position.json` while it is connected,
+along with the G54 offset in effect. Writes are throttled while the machine
+moves and made as soon as it stops, so a stopped tool's position is exact.
+
+After a restart or a reconnection the sender compares the position the
+controller reports with the one it recorded, once the machine is idle. If
+they agree, nothing happens. If they differ, the controller has most likely
+lost its position (an Arduino based board that resets when the port opens
+can report zero), while the tool stayed where it was. By default
+(`position.trust_record`) the sender then:
+
+1. moves the work zero (G54) so that the tool still reads where it was
+   recorded, and moves the stored work offsets and paused positions of
+   every job to match;
+2. asks the operator whether the machine moved, through `GET /machine`.
+
+```sh
+curl localhost:8080/machine | jq .position_check
+# {"recorded": [0, 0, 0], "reported": [3, 4, 1], "adjusted": true,
+#  "question": "...Has the machine moved since?...", ...}
+
+# The machine was not moved by hand: keep the correction.
+curl -X POST localhost:8080/machine/position-check -H 'content-type: application/json' \
+  -d '{"moved": false}'
+
+# It was moved: put the work zero back and take the controller's report as it is.
+curl -X POST localhost:8080/machine/position-check -H 'content-type: application/json' \
+  -d '{"moved": true}'
+```
+
+The answer is refused with `409` while a job is active, and when no check is
+waiting. Until it is answered, `position_check` stays in `GET /machine`.
+
+To make the sender wait instead, turn trust off. A difference then blocks
+starting and resuming jobs, with the question as the reason, until someone
+answers. Nothing is moved in the meantime.
+
+```sh
+curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
+  -d '{"position": {"trust_record": false}}'
+```
+
+This relies on the controller stopping when the sender goes away. If a
+controller keeps executing lines it had already buffered after the sender
+has gone, the tool moves without the sender, and the check shows the
+difference. Trust is then wrong until the operator answers.
 
 ### Watching the connection
 

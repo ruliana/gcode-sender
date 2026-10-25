@@ -3,6 +3,7 @@ mod controller;
 mod gcode;
 mod grbl;
 mod http;
+mod position;
 mod program;
 mod settings;
 mod store;

@@ -21,6 +21,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::bounds::Bounds;
+use crate::position::{self, Position};
 use crate::program::{self, ProgramLine};
 use crate::settings::Settings;
 
@@ -174,6 +175,50 @@ impl JobStore {
     /// Stores a new job. It appears under `jobs/` only once the program and
     /// its record are both on disk, so a crash partway through leaves no
     /// job behind (and no half-written one for the next start to trip over).
+    /// The recorded tool position, if any has been recorded.
+    pub fn position(&self) -> Result<Position> {
+        match std::fs::read(self.data_dir.join("position.json")) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Position::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_position(&self, position: &Position) -> Result<()> {
+        write_atomic(
+            &self.data_dir.join("position.json"),
+            &serde_json::to_vec_pretty(position)?,
+        )
+    }
+
+    /// Moves the stored work offsets and paused positions to a new frame.
+    /// `offset` is `(from, to)` for jobs that ran under `from`; `shift` moves
+    /// the machine positions a paused job is waiting at.
+    pub fn rebase_jobs(&self, offset: Option<([f64; 3], [f64; 3])>, shift: [f64; 3]) -> Result<()> {
+        for mut job in self.list()? {
+            let mut changed = false;
+            if let Some((from, to)) = offset
+                && job
+                    .work_offset
+                    .is_some_and(|o| position::same_offset(o, from))
+            {
+                job.work_offset = Some(to);
+                changed = true;
+            }
+            if job.state == JobState::Paused
+                && let Some(point) = job.paused_at.as_mut()
+            {
+                point.position = position::add(point.position, shift);
+                point.lifted_to = point.lifted_to.map(|z| z + shift[2]);
+                changed = true;
+            }
+            if changed {
+                self.save(&job)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn create(&self, name: Option<String>, source: &str) -> Result<JobRecord> {
         let id = Uuid::new_v4().to_string();
         let staging = self.root.join(format!("{STAGING_PREFIX}{id}"));
@@ -408,6 +453,39 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, good.id);
         assert!(store.recover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebasing_moves_stored_offsets_and_paused_positions_together() {
+        let (_dir, store) = open();
+        let mut paused = store.create(None, "G1 X1 F600\n").unwrap();
+        paused.state = JobState::Paused;
+        paused.work_offset = Some([0.0, 0.0, 0.0]);
+        paused.paused_at = Some(PausePoint {
+            position: [1.0, 2.0, -1.0],
+            lifted_to: Some(9.0),
+        });
+        store.save(&paused).unwrap();
+        let mut other = store.create(None, "G1 X1 F600\n").unwrap();
+        other.work_offset = Some([5.0, 5.0, 5.0]);
+        store.save(&other).unwrap();
+
+        store
+            .rebase_jobs(Some(([0.0; 3], [-10.0, -20.0, -5.0])), [-10.0, -20.0, -5.0])
+            .unwrap();
+
+        let paused = store.get(&paused.id).unwrap().unwrap();
+        assert_eq!(paused.work_offset, Some([-10.0, -20.0, -5.0]));
+        assert_eq!(
+            paused.paused_at,
+            Some(PausePoint {
+                position: [-9.0, -18.0, -6.0],
+                lifted_to: Some(4.0),
+            })
+        );
+        // A job that ran under a different offset is left as it was.
+        let other = store.get(&other.id).unwrap().unwrap();
+        assert_eq!(other.work_offset, Some([5.0, 5.0, 5.0]));
     }
 
     #[test]
