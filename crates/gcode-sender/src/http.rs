@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(delete_job))
+        .route("/jobs/{id}/program", get(get_program))
         .route("/jobs/{id}/start", post(start_job))
         .route("/jobs/{id}/pause", post(pause_job))
         .route("/jobs/{id}/resume", post(resume_job))
@@ -210,6 +211,20 @@ async fn get_job(
 ) -> ApiResult<Json<JobRecord>> {
     let record = app.store.get(&id)?.ok_or_else(not_found)?;
     Ok(Json(freshest(&app, record)))
+}
+
+/// The program as uploaded, for clients that want to show it.
+async fn get_program(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
+    let store = app.store.clone();
+    let source = tokio::task::spawn_blocking(move || store.source(&id))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))??
+        .ok_or_else(not_found)?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        source,
+    )
+        .into_response())
 }
 
 async fn delete_job(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {

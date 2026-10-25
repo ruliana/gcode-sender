@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>G-code Sender</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/lib.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -19,16 +20,37 @@
   <div id="alarm" class="banner error" role="alert" hidden></div>
   <div id="notice" class="banner error" role="alert" hidden></div>
 
+  <section id="position-check" class="banner ask" role="alertdialog" aria-labelledby="pc-title" hidden>
+    <strong id="pc-title">Did the machine move?</strong>
+    <p id="pc-question"></p>
+    <p id="pc-detail" class="muted"></p>
+    <div class="row">
+      <button type="button" data-moved="false">No, it stayed where it was</button>
+      <button type="button" data-moved="true">Yes, it was moved</button>
+    </div>
+  </section>
+
   <main class="layout">
     <section class="card" aria-labelledby="machine-title">
       <h2 id="machine-title">Machine</h2>
-      <dl class="facts">
-        <dt>State</dt><dd id="state">-</dd>
-        <dt>Machine</dt><dd id="mpos">-</dd>
-        <dt>Work</dt><dd id="wpos">-</dd>
-        <dt>Work offset (G54)</dt><dd id="woff">-</dd>
-        <dt>Feed</dt><dd id="feed">-</dd>
-      </dl>
+      <div class="row">
+        <span id="state" class="chip">-</span>
+        <span id="sys-label" class="sys" title="Active work coordinate system"></span>
+        <span id="feed" class="muted"></span>
+      </div>
+      <table class="dro">
+        <thead>
+          <tr><th></th><th>X</th><th>Y</th><th>Z</th></tr>
+        </thead>
+        <tbody>
+          <tr class="primary"><th>Work</th>
+            <td id="dro-work-x">-</td><td id="dro-work-y">-</td><td id="dro-work-z">-</td></tr>
+          <tr><th>Machine</th>
+            <td id="dro-mach-x">-</td><td id="dro-mach-y">-</td><td id="dro-mach-z">-</td></tr>
+          <tr><th>Zero</th>
+            <td id="dro-off-x">-</td><td id="dro-off-y">-</td><td id="dro-off-z">-</td></tr>
+        </tbody>
+      </table>
       <p id="last-error" class="muted" hidden></p>
       <div class="row">
         <button type="button" data-action="unlock" data-needs="ready">Unlock</button>
@@ -63,10 +85,24 @@
         </label>
       </div>
       <button type="button" id="jog-cancel" class="danger" data-needs="ready">Cancel jog</button>
+      <p class="muted keys">Keys: arrows jog X and Y, Page Up and Page Down jog Z, Shift goes ten times as far, Esc cancels.</p>
     </section>
 
     <section class="card" aria-labelledby="zero-title">
       <h2 id="zero-title">Work zero</h2>
+      <table class="systems">
+        <thead>
+          <tr><th>System</th><th>X</th><th>Y</th><th>Z</th><th></th></tr>
+        </thead>
+        <tbody id="systems-body"></tbody>
+      </table>
+      <label class="system-pick">Change the zero of
+        <select id="work-system">
+          <option value="">the active system</option>
+          <option>G54</option><option>G55</option><option>G56</option>
+          <option>G57</option><option>G58</option><option>G59</option>
+        </select>
+      </label>
       <form id="zero-form">
         <p class="muted">Call the tool's current position these coordinates. Leave an axis blank to leave it alone.</p>
         <div class="row">
@@ -77,7 +113,7 @@
         <button type="submit" data-needs="move">Set work zero here</button>
       </form>
       <form id="offset-form">
-        <p class="muted">Put work zero (G54) at these machine coordinates. Leave an axis blank to leave it alone.</p>
+        <p class="muted">Put the zero at these machine coordinates instead. Leave an axis blank to leave it alone.</p>
         <div class="row">
           <label>X <input id="offset-x" type="number" step="any"></label>
           <label>Y <input id="offset-y" type="number" step="any"></label>
@@ -102,8 +138,9 @@
           <span id="job-counts" class="muted"></span>
         </div>
         <progress id="job-progress" value="0" max="1"></progress>
-        <p id="job-reason" class="error-line" hidden></p>
-        <ul id="job-facts" class="facts-list"></ul>
+        <p id="job-times" class="muted"></p>
+        <p id="job-reason" class="reason" hidden></p>
+        <p id="job-hint" class="hint"></p>
         <div class="row">
           <button type="button" data-job-action="start" data-needs="start">Start</button>
           <button type="button" data-job-action="pause" data-needs="pause">Pause and lift tool</button>
@@ -112,6 +149,9 @@
           <button type="button" data-job-action="stop" data-needs="stop" class="danger">Stop</button>
           <button type="button" data-job-action="delete" data-needs="delete">Delete</button>
         </div>
+        <ul id="job-facts" class="facts-list"></ul>
+        <canvas id="preview" class="preview" role="img" aria-label="Toolpath preview"></canvas>
+        <p id="preview-note" class="muted"></p>
         <details class="resume-options">
           <summary>Resume options</summary>
           <div class="row">
@@ -133,7 +173,7 @@
     </section>
 
     <section class="card" aria-labelledby="settings-title">
-      <h2 id="settings-title">Pausing</h2>
+      <h2 id="settings-title">Settings</h2>
       <form id="settings-form">
         <label class="check">
           <input id="set-lift" type="checkbox"> Lift the tool when a job pauses
@@ -147,8 +187,11 @@
         <label>Spindle dwell on resume (s)
           <input id="set-dwell" type="number" min="0" max="60" step="any">
         </label>
+        <label class="check">
+          <input id="set-trust" type="checkbox"> After a reset, keep the tool where it was recorded
+        </label>
         <div class="row">
-          <button type="submit">Save pause settings</button>
+          <button type="submit">Save settings</button>
         </div>
       </form>
     </section>

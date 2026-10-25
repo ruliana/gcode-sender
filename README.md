@@ -19,11 +19,43 @@ This is a monorepo.
 | --- | --- |
 | `crates/gcode-sender` | The sender: serial link, job streaming, HTTP API, and the web UI it serves |
 | `crates/grbl-sim` | A simulated controller on a pseudo-terminal, used by the tests |
-| `web/` | The web UI: `index.html`, `style.css`, and `app.js`. Plain files, no build step |
+| `web/` | The web UI: `index.html`, `style.css`, `app.js`, and `lib.js` (the pure logic, with tests in `lib.test.js`). Plain files, no build step |
 
 The web UI is compiled into the sender binary (`crates/gcode-sender/src/web.rs`),
 so the server is the only thing to copy onto the machine. Edit the files in
-`web/` and rebuild.
+`web/` and rebuild. The UI is plain ES5-style script and needs no build tools;
+the logic that can be wrong without anyone noticing (the toolpath parser, time
+estimates, key mapping) lives in `web/lib.js` and is checked with
+`node --test web/lib.test.js`.
+
+## Web UI
+
+The UI only offers what the machine can do right now. A button that cannot
+work is disabled and says why when you hover it, and the selected job shows a
+one-line hint about what to do next.
+
+- **Machine**: work, machine, and zero readouts for X, Y and Z, the active
+  work system, and the tab title shows state and job progress, so you can
+  watch from another window.
+- **Jog**: buttons, or the keyboard: arrow keys for X and Y, Page Up and Page
+  Down for Z, Shift for ten times the step, Esc to cancel. Keys are ignored
+  while typing in a field.
+- **Work zero**: all of G54 to G59 with their zeros, one click to switch, and
+  the zero forms apply to the system you pick.
+- **Position check**: after a reset or a lost connection, the sender asks
+  whether the machine was moved. The UI shows that question at the top of the
+  page with both answers, and says when jobs are waiting for the answer.
+- **Jobs**: upload, start, pause with tool lift, feed hold, resume (with
+  options), stop. It shows elapsed and estimated remaining time, why a job
+  paused or failed, and a preview of the toolpath drawn from the exact program
+  that was uploaded (`GET /jobs/{id}/program`), with a warning if it would
+  leave the boundaries from the current work zero.
+- **Settings** and **Boundaries**: saving a setting keeps the ones the form
+  does not show.
+
+![Overview](docs/screenshots/overview.png)
+![A paused job](docs/screenshots/job-paused.png)
+![The position check](docs/screenshots/position-check.png)
 
 ## Local only
 
@@ -94,6 +126,7 @@ identified yet.
 | `POST /jobs?name=<name>` | Upload a program; the body is the G-code text. Returns `201` |
 | `GET /jobs` | List jobs, oldest first |
 | `GET /jobs/{id}` | One job, with live progress while it runs |
+| `GET /jobs/{id}/program` | The program as uploaded, as plain text, so its line numbers match `last_acked_line` and `line_errors` |
 | `DELETE /jobs/{id}` | Delete a job that is not active |
 | `POST /jobs/{id}/start` | Start streaming. Also re-runs a finished job from the top |
 | `POST /jobs/{id}/pause` | Stop the machine, lift the tool and free the machine for jogging; see below. A body of `{"lift": false}` makes it a plain feed hold |

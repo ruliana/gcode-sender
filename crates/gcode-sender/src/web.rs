@@ -8,6 +8,7 @@ use axum::routing::get;
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_JS: &str = include_str!("../../../web/app.js");
+const LIB_JS: &str = include_str!("../../../web/lib.js");
 const STYLE_CSS: &str = include_str!("../../../web/style.css");
 
 /// The page may only run its own scripts and styles and talk to its own
@@ -24,6 +25,10 @@ where
         .route(
             "/",
             get(|| async { asset(INDEX_HTML, "text/html; charset=utf-8") }),
+        )
+        .route(
+            "/lib.js",
+            get(|| async { asset(LIB_JS, "text/javascript; charset=utf-8") }),
         )
         .route(
             "/app.js",

@@ -244,3 +244,27 @@ async fn rejected_line_pauses_job_with_its_line_number() {
     let job = h.wait_job_state(&id, "completed").await;
     assert_eq!(job["acked_lines"], 32);
 }
+
+#[tokio::test]
+async fn the_uploaded_program_can_be_read_back_as_sent() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    // Comments, blank lines and `%` are kept: line numbers must match the
+    // job's `last_acked_line` and `line_errors`.
+    let source = zigzag(3);
+    let id = h.upload(&source).await["id"].as_str().unwrap().to_string();
+
+    let res = reqwest::get(format!("{}/jobs/{id}/program", h.base))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_type = res.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(content_type.starts_with("text/plain"), "{content_type}");
+    assert_eq!(res.text().await.unwrap(), source);
+
+    for bad in ["no-such-job", "00000000-0000-0000-0000-000000000000"] {
+        let res = reqwest::get(format!("{}/jobs/{bad}/program", h.base))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{bad}");
+    }
+}
