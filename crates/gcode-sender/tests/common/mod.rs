@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -125,6 +125,12 @@ impl Harness {
             res,
             buf: Vec::new(),
         }
+    }
+
+    /// The directory the server keeps its state in, for tests that damage
+    /// it the way a power cut might.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Starts a new server process on the same data directory.
@@ -340,6 +346,15 @@ pub fn zigzag_file_line(index: usize) -> usize {
 }
 
 /// Lines the controller was sent that are part of a program, not queries.
+/// What was sent to the controller, leaving out the work coordinate reads
+/// (`$#` and `$G`) the server makes on its own while idle. They move nothing.
+pub fn commands_sent(sim: &Simulator) -> Vec<String> {
+    sim.received_lines()
+        .into_iter()
+        .filter(|l| l != "$#" && l != "$G")
+        .collect()
+}
+
 pub fn program_lines(sim: &Simulator) -> Vec<String> {
     sim.received_lines()
         .into_iter()

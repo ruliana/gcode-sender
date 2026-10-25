@@ -31,6 +31,11 @@ async fn accepted(h: &Harness, path: &str, body: Value) {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}: {reply}");
 }
 
+async fn put_accepted(h: &Harness, path: &str, body: Value) {
+    let (status, reply) = h.put_json(path, &body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}: {reply}");
+}
+
 async fn set_offset(h: &Harness, body: Value) -> (StatusCode, Value) {
     h.put_json("/machine/work-offset", &body).await
 }
@@ -38,8 +43,8 @@ async fn set_offset(h: &Harness, body: Value) -> (StatusCode, Value) {
 /// A request that must be refused with nothing sent to the controller.
 async fn assert_refused(h: &Harness, path: &str, body: Value, status: StatusCode, expected: &str) {
     let before = g10_lines(h).len();
-    let (got, reply) = if path == "/machine/work-offset" {
-        set_offset(h, body.clone()).await
+    let (got, reply) = if path == "/machine/work-offset" || path == "/machine/work-system" {
+        h.put_json(path, &body).await
     } else {
         h.post_json(path, &body).await
     };
@@ -240,7 +245,11 @@ async fn a_job_remembers_the_zero_it_ran_with() {
     wait_offset(&h, [12.0, -3.0, 7.5]).await;
     let id = h.run(&zigzag(5)).await;
     let job = h.wait_job_state(&id, "completed").await;
-    assert_eq!(job["work_offset"], json!([12.0, -3.0, 7.5]));
+    assert_eq!(job["work_offsets"]["system"], "G54");
+    assert_eq!(
+        job["work_offsets"]["offsets"]["G54"],
+        json!([12.0, -3.0, 7.5])
+    );
 }
 
 #[tokio::test]
@@ -288,5 +297,153 @@ async fn a_moved_zero_can_be_accepted_when_resuming() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let job = h.wait_job_state(&id, "completed").await;
     // The job now remembers the zero it finished with.
-    assert_eq!(job["work_offset"], json!([0.0, 4.5, 0.0]));
+    assert_eq!(
+        job["work_offsets"]["offsets"]["G54"],
+        json!([0.0, 4.5, 0.0])
+    );
+}
+
+/// Waits until `GET /machine` shows the zero of `system` as `offset`.
+async fn wait_zero(h: &Harness, system: &str, offset: Value) -> Value {
+    h.wait_machine(&format!("{system} at {offset}"), |m| {
+        m["work"]["offsets"][system] == offset
+    })
+    .await
+}
+
+#[tokio::test]
+async fn work_zero_sets_any_of_the_six_systems_without_selecting_it() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    h.sim.set_position([30.0, 20.0, -5.0]);
+    h.wait_machine("the position", |m| {
+        m["status"]["machine_position"] == json!([30.0, 20.0, -5.0])
+    })
+    .await;
+
+    accepted(
+        &h,
+        "/machine/work-zero",
+        json!({"x": 0, "y": 0, "system": "G56"}),
+    )
+    .await;
+    assert_eq!(g10_lines(&h), ["G21 G90 G10 L20 P3 X0.000 Y0.000"]);
+
+    let m = wait_zero(&h, "G56", json!([30.0, 20.0, 0.0])).await;
+    assert_eq!(h.sim.work_offset_of(56), [30.0, 20.0, 0.0]);
+    // G54 is still the active system, and its zero did not move.
+    assert_eq!(m["work"]["system"], "G54");
+    assert_eq!(m["work"]["offsets"]["G54"], json!([0.0, 0.0, 0.0]));
+    assert_eq!(m["status"]["work_offset"], json!([0.0, 0.0, 0.0]));
+}
+
+#[tokio::test]
+async fn work_system_makes_a_system_active_for_work_coordinates() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    h.sim.set_position([50.0, 0.0, 0.0]);
+    h.wait_machine("the position", |m| {
+        m["status"]["machine_position"] == json!([50.0, 0.0, 0.0])
+    })
+    .await;
+    put_accepted(
+        &h,
+        "/machine/work-offset",
+        json!({"x": -100, "system": "G55"}),
+    )
+    .await;
+    wait_zero(&h, "G55", json!([-100.0, 0.0, 0.0])).await;
+
+    put_accepted(&h, "/machine/work-system", json!({"system": "G55"})).await;
+    assert_eq!(h.sim.active_system(), 55);
+    let m = h
+        .wait_machine("G55 to be active", |m| m["work"]["system"] == "G55")
+        .await;
+    // Work X is machine X minus the G55 zero: the tool is at X150 in G55.
+    wait_for("the work position in G55", || async {
+        let m = h.machine().await;
+        (m["status"]["work_position"] == json!([150.0, 0.0, 0.0])).then_some(())
+    })
+    .await;
+    assert_eq!(m["status"]["work_offset"], json!([-100.0, 0.0, 0.0]));
+}
+
+#[tokio::test]
+async fn invalid_systems_and_mixed_requests_are_refused_nothing_sent() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    for system in ["G53", "G59.1", "G60", "G92"] {
+        assert_refused(
+            &h,
+            "/machine/work-offset",
+            json!({"x": 1, "system": system}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "G54 to G59",
+        )
+        .await;
+    }
+    assert_refused(
+        &h,
+        "/machine/work-system",
+        json!({}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "give the system",
+    )
+    .await;
+    assert_refused(
+        &h,
+        "/machine/work-system",
+        json!({"system": "G55", "x": 0}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "takes no x, y or z",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_program_cuts_in_the_system_it_selects() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    put_accepted(
+        &h,
+        "/machine/work-offset",
+        json!({"x": 100, "y": 50, "system": "G55"}),
+    )
+    .await;
+    wait_zero(&h, "G55", json!([100.0, 50.0, 0.0])).await;
+
+    // X10 in G55 is X110 in machine coordinates; G54 is untouched.
+    let id = h.run("G55 G90 G1 X10 Y5 F500\n").await;
+    h.wait_job_state(&id, "completed").await;
+    assert_eq!(h.sim.position(), [110.0, 55.0, 0.0]);
+    assert_eq!(h.sim.active_system(), 55);
+    let job = h.job(&id).await;
+    assert_eq!(job["work_offsets"]["system"], "G54");
+}
+
+#[tokio::test]
+async fn boundaries_follow_the_system_a_program_selects() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    put_accepted(
+        &h,
+        "/machine/work-offset",
+        json!({"x": 100, "system": "G55"}),
+    )
+    .await;
+    wait_zero(&h, "G55", json!([100.0, 0.0, 0.0])).await;
+    let (status, _) = h.put_json("/machine/bounds", &json!({"x": [0, 200]})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // X150 in G55 is X250 in machine coordinates: outside.
+    let (status, body) = h
+        .post_body("/jobs?name=g55.nc", "G55 G90 G1 X150 F500\n")
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let (status, body) = h.post(&format!("/jobs/{id}/start")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("X to 250"),
+        "{body}"
+    );
+
+    // The same move in G54, where the zero is still at machine X0, is inside.
+    let ok = h.run("G90 G1 X150 F500\n").await;
+    h.wait_job_state(&ok, "completed").await;
 }

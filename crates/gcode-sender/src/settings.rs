@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     pub pause: PauseSettings,
+    pub position: PositionSettings,
+}
+
+/// What to do when the controller reports a different position than the
+/// sender last recorded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PositionSettings {
+    /// Trust the recorded position: keep the tool where the record puts it by
+    /// moving the work zero, then ask the operator whether the machine moved.
+    /// Off, jobs wait until the operator has answered.
+    pub trust_record: bool,
+}
+
+impl Default for PositionSettings {
+    fn default() -> Self {
+        Self { trust_record: true }
+    }
 }
 
 /// What pausing a job does to the tool.

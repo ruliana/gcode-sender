@@ -45,7 +45,9 @@ pub fn router(state: AppState) -> Router {
         .route("/machine/home", post(home))
         .route("/machine/reset", post(reset))
         .route("/machine/work-zero", post(work_zero))
+        .route("/machine/position-check", post(position_check))
         .route("/machine/work-offset", put(work_offset))
+        .route("/machine/work-system", put(work_system))
         .route("/machine/jog", post(jog))
         .route("/machine/jog/cancel", post(jog_cancel))
         .route("/settings", get(get_settings).put(put_settings))
@@ -288,6 +290,21 @@ async fn work_change(
     Ok((StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))))
 }
 
+#[derive(Deserialize)]
+struct PositionAnswer {
+    moved: bool,
+}
+
+/// Answers a question about whether the machine moved since the tool's
+/// position was last recorded.
+async fn position_check(
+    State(app): State<AppState>,
+    Json(answer): Json<PositionAnswer>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    app.controller.position_check(answer.moved).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))))
+}
+
 async fn work_zero(
     State(app): State<AppState>,
     body: Bytes,
@@ -300,6 +317,13 @@ async fn work_offset(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     work_change(app, WorkChange::Offset, body).await
+}
+
+async fn work_system(
+    State(app): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    work_change(app, WorkChange::Select, body).await
 }
 
 async fn jog(

@@ -104,7 +104,9 @@ identified yet.
 | `POST /machine/home` | `$H`: run the homing cycle |
 | `POST /machine/reset` | Soft reset, for example to clear a hold left by an earlier session |
 | `POST /machine/work-zero` | Make the tool's current position a work coordinate, see below |
-| `PUT /machine/work-offset` | Set where work zero is in machine coordinates, see below |
+| `POST /machine/position-check` | Answer whether the machine moved, see below |
+| `PUT /machine/work-offset` | Set where a work zero is in machine coordinates, see below |
+| `PUT /machine/work-system` | Make a work coordinate system (G54 to G59) the active one, see below |
 | `POST /machine/jog` | Move the tool by hand, see below |
 | `POST /machine/jog/cancel` | Stop a jog in progress and drop the queued ones |
 | `GET /settings` | The sender's settings, see below |
@@ -146,7 +148,11 @@ curl -s localhost:8080/jobs/$id | jq '{state, acked_lines, total_lines}'
   and keeps its position instead of raising `ALARM:3`.
 - **State on disk.** Jobs live under `--data-dir` as the uploaded program
   plus a JSON record written with an atomic rename. Progress is saved
-  every 250 ms while running.
+  every 250 ms while running. Each rename is synced to disk, so a power cut
+  leaves the old or the new record, never a mix. A job appears only once its
+  program and record are both written, and a record that cannot be read is
+  skipped with a warning rather than stopping the server. The tool's last
+  known position is kept in `position.json` the same way, see below.
 
 ### Pausing and resuming
 
@@ -182,11 +188,15 @@ Things to know:
   the tool is already as high as the Z boundary allows, the job is still
   paused and released, with `lifted_to` null and the reason saying why. If
   the program cannot be picked up again (it uses `G92`, `G10`, `G28`, `G30`,
-  another work offset, or is in `G91` there), the pause is a plain feed
+  `G59.1` to `G59.3`, or is in `G91` there), the pause is a plain feed
   hold, and the reason says so.
 - `POST /jobs/{id}/stop` on a released pause just retires the job. A
   released pause survives a server restart; moving the work zero in
   between is caught, as for any resume (`accept_moved_zero`).
+- If the server stops while the tool is being lifted, the job comes back
+  paused at the height it was lifting to, and resume raises the tool there.
+  The lift may or may not have finished, and the reason says so. While the
+  lift is under way the record carries that height as `lift_pending`.
 - Giving `retract` to `resume` overrides the automatic return.
 - A line the controller rejects still holds the machine in place, without
   lifting, since something is wrong and the operator should look first.
@@ -195,7 +205,7 @@ The behaviour is a setting, on by default:
 
 ```sh
 curl localhost:8080/settings
-# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0}}
+# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0},"position":{"trust_record":true}}
 
 # A pause is a plain feed hold; resume is a cycle start.
 curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
@@ -259,13 +269,63 @@ curl -X POST localhost:8080/jobs/$id/resume -H 'content-type: application/json' 
 
 Repeating absolute moves is harmless; repeating incremental ones is not.
 A program in `G91` at the resume point is refused with `422`, as is one
-that uses `G92`, `G10`, `G28`, `G30`, or a work offset other than `G54`
-before that point, because the server cannot rebuild that state. Those
+that uses `G92`, `G10`, `G28`, `G30`, or `G59.1` to `G59.3` before that
+point, because the server cannot rebuild that state. Those
 jobs can still be started again from the top.
 
 If the controller resets while moving (an Arduino based LongBoard does when
 the USB port reopens), it raises `ALARM:3` and may have lost its position.
 The server will not resume until you have dealt with the alarm.
+
+### Where the tool is
+
+The sender is the only thing that moves the machine, so the sender keeps
+the tool's last known position in `position.json` while it is connected,
+along with every work zero (G54 to G59). Writes are throttled while the machine
+moves and made as soon as it stops, so a stopped tool's position is exact.
+
+After a restart or a reconnection the sender compares the position the
+controller reports with the one it recorded, once the machine is idle. If
+they agree, nothing happens. If they differ, the controller has most likely
+lost its position (an Arduino based board that resets when the port opens
+can report zero), while the tool stayed where it was. By default
+(`position.trust_record`) the sender then:
+
+1. moves every work zero (G54 to G59) by the same amount, so that the
+   tool still reads where it was recorded in whichever system is active,
+   and moves the stored zeros and paused positions of every job to match;
+2. asks the operator whether the machine moved, through `GET /machine`.
+
+```sh
+curl localhost:8080/machine | jq .position_check
+# {"recorded": [0, 0, 0], "reported": [3, 4, 1], "adjusted": true,
+#  "question": "...Has the machine moved since?...", ...}
+
+# The machine was not moved by hand: keep the correction.
+curl -X POST localhost:8080/machine/position-check -H 'content-type: application/json' \
+  -d '{"moved": false}'
+
+# It was moved: put the zeros back and take the controller's report as it is.
+curl -X POST localhost:8080/machine/position-check -H 'content-type: application/json' \
+  -d '{"moved": true}'
+```
+
+The answer is refused with `409` while a job is active, and when no check is
+waiting. Until it is answered, `position_check` stays in `GET /machine`.
+
+To make the sender wait instead, turn trust off. A difference then blocks
+starting and resuming jobs, with the question as the reason, until someone
+answers. Nothing is moved in the meantime.
+
+```sh
+curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
+  -d '{"position": {"trust_record": false}}'
+```
+
+This relies on the controller stopping when the sender goes away. If a
+controller keeps executing lines it had already buffered after the sender
+has gone, the tool moves without the sender, and the check shows the
+difference. Trust is then wrong until the operator answers.
 
 ### Watching the connection
 
@@ -337,40 +397,59 @@ set, the destination is checked first, counting the jogs still queued, and a
 jog that leaves them is refused with `422`. As with jobs, this is on top of
 the controller's soft limits, not instead of them.
 
-### Work zero
+### Work zero and work offsets
 
-The work zero is the G54 offset, which the controller keeps through power
-cycles. `GET /machine` reports it as `status.work_offset`, in machine
-coordinates, next to `machine_position` and `work_position`.
+The controller keeps six work coordinate systems, G54 to G59, and each one's
+zero survives power cycles. One of them is active: jogs in work coordinates
+and `work_position` use it. `GET /machine` reports them under `work`, with
+the active `system` and the `offsets` of all six in machine coordinates. The
+active zero is also `status.work_offset`, next to `machine_position` and
+`work_position`.
 
 ```sh
-# The tool is at the corner of the stock: call this X0 Y0.
+# The tool is at the corner of the stock: call this X0 Y0 in the active system.
 curl -X POST localhost:8080/machine/work-zero -H 'content-type: application/json' \
   -d '{"x": 0, "y": 0}'
 
-# The tool is touching the top of a 10 mm board: call this Z10.
+# The tool is touching the top of a 10 mm board: call this Z10 in G55.
 curl -X POST localhost:8080/machine/work-zero -H 'content-type: application/json' \
-  -d '{"z": 10}'
+  -d '{"z": 10, "system": "G55"}'
 
-# Put work zero at a known place on the machine.
+# Put the G56 zero at a known place on the machine.
 curl -X PUT localhost:8080/machine/work-offset -H 'content-type: application/json' \
-  -d '{"x": -100, "y": -50}'
+  -d '{"x": -100, "y": -50, "system": "G56"}'
+
+# Make G55 the active system, for jogging and the work position.
+curl -X PUT localhost:8080/machine/work-system -H 'content-type: application/json' \
+  -d '{"system": "G55"}'
 ```
 
-`work-zero` sends `G10 L20 P1` and `work-offset` sends `G10 L2 P1`. Both
-take any of `x`, `y` and `z`, in millimetres, and leave the other axes
-alone. They send `G21 G90` first, so the controller is left in millimetres
-and absolute mode whatever it was in before. Only G54 is supported. A
-change is refused (`409`) during a job, an alarm, or any state but idle,
-because the new zero is measured from where the tool is at that moment.
+`system` is `G54` to `G59`. The zero and offset calls default to the active
+system, and `work-system` needs one. `work-zero` sends `G10 L20 P<n>` and
+`work-offset` sends `G10 L2 P<n>`, where `P` is 1 for G54 to 6 for G59, so a
+zero can be set without selecting its system first. `work-system` sends
+`G21 G90 G55` (or whichever system). Each takes `x`, `y` and `z` in
+millimetres, and leaves the other axes alone, except that `work-system` takes
+none. The commands send `G21 G90` first, so the controller is left in
+millimetres and absolute mode whatever it was in before. A change is refused
+(`409`) during a job, an alarm, or any state but idle, because the new zero is
+measured from where the tool is at that moment.
 
-A job remembers the work offset it ran with (`work_offset` on the job).
-Resuming a stopped, failed or interrupted job after the zero has moved is
-refused with `409`, since the rest of the program would be cut somewhere
-else. Put the zero back, or pass `"accept_moved_zero": true` to resume
-anyway. Boundaries are in machine coordinates, so they stay put when the
-zero moves; a program is checked against them using the offset in effect
-when it starts.
+The server reads the zeros back (`$#`) and the active system (`$G`) when the
+controller connects, after each change, and every couple of seconds while
+idle, so a zero changed from a panel shows up without a restart. Until the
+first read the controller is not ready, and jobs wait for it.
+
+A program starts in the active system and cuts in each system it selects with
+`G54` to `G59`. Boundaries are in machine coordinates, so they stay put when a
+zero moves. A program is checked against them using the zero of each system it
+cuts in. Grbl 1.1 refuses `G59.1` to `G59.3`, so those are refused here too.
+
+A job records the zeros it ran with (`work_offsets` on the job). Resuming a
+stopped, failed or interrupted job after a zero that the rest of the program
+cuts in has moved is refused with `409`, since the program would be cut
+somewhere else. Put the zero back, or pass `"accept_moved_zero": true` to
+resume anyway. A zero the program never uses can move freely.
 
 ### Boundaries
 
@@ -389,7 +468,7 @@ absolute and incremental moves, `G53`, and arcs (including their bulge
 between the end points, in the center and radius forms) are understood. A
 move outside the boundaries is refused with `422` naming the line, the
 axis and the value, and nothing reaches the controller. A program the
-server cannot follow (`G92`, `G10`, `G28`, `G30`, other work offsets,
+server cannot follow (`G92`, `G10`, `G28`, `G30`, `G59.1` to `G59.3`,
 parameters, expressions) is refused too, because it could move anywhere.
 These checks apply only while boundaries are set.
 
