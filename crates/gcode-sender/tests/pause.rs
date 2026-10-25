@@ -439,7 +439,10 @@ async fn settings_have_defaults_and_are_kept() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
-        json!({"pause": {"lift": true, "height": 10.0, "z": null, "dwell_s": 3.0}})
+        json!({
+            "pause": {"lift": true, "height": 10.0, "z": null, "dwell_s": 3.0},
+            "position": {"trust_record": true}
+        })
     );
 
     set_settings(
@@ -447,7 +450,10 @@ async fn settings_have_defaults_and_are_kept() {
         json!({"pause": {"lift": false, "height": 4, "z": -2.5}}),
     )
     .await;
-    let expected = json!({"pause": {"lift": false, "height": 4.0, "z": -2.5, "dwell_s": 3.0}});
+    let expected = json!({
+        "pause": {"lift": false, "height": 4.0, "z": -2.5, "dwell_s": 3.0},
+        "position": {"trust_record": true}
+    });
     assert_eq!(h.get("/settings").await.1, expected);
 
     h.restart_server().await;

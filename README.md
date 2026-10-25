@@ -68,6 +68,7 @@ identified yet.
 | `POST /machine/home` | `$H`: run the homing cycle |
 | `POST /machine/reset` | Soft reset, for example to clear a hold left by an earlier session |
 | `POST /machine/work-zero` | Make the tool's current position a work coordinate, see below |
+| `POST /machine/position-check` | Answer whether the machine moved, see below |
 | `PUT /machine/work-offset` | Set where a work zero is in machine coordinates, see below |
 | `PUT /machine/work-system` | Make a work coordinate system (G54 to G59) the active one, see below |
 | `POST /machine/jog` | Move the tool by hand, see below |
@@ -111,7 +112,11 @@ curl -s localhost:8080/jobs/$id | jq '{state, acked_lines, total_lines}'
   and keeps its position instead of raising `ALARM:3`.
 - **State on disk.** Jobs live under `--data-dir` as the uploaded program
   plus a JSON record written with an atomic rename. Progress is saved
-  every 250 ms while running.
+  every 250 ms while running. Each rename is synced to disk, so a power cut
+  leaves the old or the new record, never a mix. A job appears only once its
+  program and record are both written, and a record that cannot be read is
+  skipped with a warning rather than stopping the server. The tool's last
+  known position is kept in `position.json` the same way, see below.
 
 ### Pausing and resuming
 
@@ -152,6 +157,10 @@ Things to know:
 - `POST /jobs/{id}/stop` on a released pause just retires the job. A
   released pause survives a server restart; moving the work zero in
   between is caught, as for any resume (`accept_moved_zero`).
+- If the server stops while the tool is being lifted, the job comes back
+  paused at the height it was lifting to, and resume raises the tool there.
+  The lift may or may not have finished, and the reason says so. While the
+  lift is under way the record carries that height as `lift_pending`.
 - Giving `retract` to `resume` overrides the automatic return.
 - A line the controller rejects still holds the machine in place, without
   lifting, since something is wrong and the operator should look first.
@@ -160,7 +169,7 @@ The behaviour is a setting, on by default:
 
 ```sh
 curl localhost:8080/settings
-# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0}}
+# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0},"position":{"trust_record":true}}
 
 # A pause is a plain feed hold; resume is a cycle start.
 curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
@@ -231,6 +240,56 @@ jobs can still be started again from the top.
 If the controller resets while moving (an Arduino based LongBoard does when
 the USB port reopens), it raises `ALARM:3` and may have lost its position.
 The server will not resume until you have dealt with the alarm.
+
+### Where the tool is
+
+The sender is the only thing that moves the machine, so the sender keeps
+the tool's last known position in `position.json` while it is connected,
+along with every work zero (G54 to G59). Writes are throttled while the machine
+moves and made as soon as it stops, so a stopped tool's position is exact.
+
+After a restart or a reconnection the sender compares the position the
+controller reports with the one it recorded, once the machine is idle. If
+they agree, nothing happens. If they differ, the controller has most likely
+lost its position (an Arduino based board that resets when the port opens
+can report zero), while the tool stayed where it was. By default
+(`position.trust_record`) the sender then:
+
+1. moves every work zero (G54 to G59) by the same amount, so that the
+   tool still reads where it was recorded in whichever system is active,
+   and moves the stored zeros and paused positions of every job to match;
+2. asks the operator whether the machine moved, through `GET /machine`.
+
+```sh
+curl localhost:8080/machine | jq .position_check
+# {"recorded": [0, 0, 0], "reported": [3, 4, 1], "adjusted": true,
+#  "question": "...Has the machine moved since?...", ...}
+
+# The machine was not moved by hand: keep the correction.
+curl -X POST localhost:8080/machine/position-check -H 'content-type: application/json' \
+  -d '{"moved": false}'
+
+# It was moved: put the zeros back and take the controller's report as it is.
+curl -X POST localhost:8080/machine/position-check -H 'content-type: application/json' \
+  -d '{"moved": true}'
+```
+
+The answer is refused with `409` while a job is active, and when no check is
+waiting. Until it is answered, `position_check` stays in `GET /machine`.
+
+To make the sender wait instead, turn trust off. A difference then blocks
+starting and resuming jobs, with the question as the reason, until someone
+answers. Nothing is moved in the meantime.
+
+```sh
+curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
+  -d '{"position": {"trust_record": false}}'
+```
+
+This relies on the controller stopping when the sender goes away. If a
+controller keeps executing lines it had already buffered after the sender
+has gone, the tool moves without the sender, and the check shows the
+difference. Trust is then wrong until the operator answers.
 
 ### Watching the connection
 

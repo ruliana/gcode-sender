@@ -4,6 +4,12 @@
 //! Layout: `<data>/jobs/<id>/program.gcode` holds the upload as received and
 //! `<data>/jobs/<id>/job.json` holds the record. Records are replaced with an
 //! atomic rename, so a crash never leaves a half-written record behind.
+//!
+//! Power can fail at any point, so every rename is followed by an fsync of
+//! the directory that holds it. Without that the rename itself can be lost
+//! and the server comes back with the previous record. A job is built in a
+//! staging directory and renamed into place once complete, so a crash during
+//! an upload leaves nothing half-made behind.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,12 +17,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::bounds::Bounds;
+use crate::position::{self, Position};
 use crate::program::{self, ProgramLine};
 use crate::settings::Settings;
-use crate::work::WorkOffsets;
+use crate::work::{WorkOffsets, Zeros};
+
+/// Prefix of the directories a job is built in before it is complete.
+const STAGING_PREFIX: &str = ".staging-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +91,14 @@ pub struct JobRecord {
     /// lifted to. Resuming brings it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<PausePoint>,
+    /// Where a pause is lifting the tool to, written before the lift is
+    /// sent. It becomes `paused_at` when the pause ends. If the server stops
+    /// first, the job comes back paused at this point rather than
+    /// interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lift_pending: Option<PausePoint>,
+    /// The G54 work offset (machine coordinates) the job last ran with, so
+    /// a resume can tell that the work zero has moved since.
     /// The work coordinate system the job started in, and where every zero
     /// was when it last ran. A resume checks the systems the program uses,
     /// so it can tell that a zero has moved since.
@@ -135,10 +154,14 @@ impl JobStore {
         let path = self.data_dir.join("bounds.json");
         match bounds {
             Some(b) => write_atomic(&path, &serde_json::to_vec_pretty(b)?),
-            None => match std::fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-                _ => Ok(()),
-            },
+            None => {
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(e.into());
+                }
+                sync_dir(&self.data_dir)
+            }
         }
     }
 
@@ -157,14 +180,60 @@ impl JobStore {
         )
     }
 
+    /// Stores a new job. It appears under `jobs/` only once the program and
+    /// its record are both on disk, so a crash partway through leaves no
+    /// job behind (and no half-written one for the next start to trip over).
+    /// The recorded tool position, if any has been recorded.
+    pub fn position(&self) -> Result<Position> {
+        match std::fs::read(self.data_dir.join("position.json")) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Position::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_position(&self, position: &Position) -> Result<()> {
+        write_atomic(
+            &self.data_dir.join("position.json"),
+            &serde_json::to_vec_pretty(position)?,
+        )
+    }
+
+    /// Moves the stored work offsets and paused positions to a new frame.
+    /// `offset` is `(from, to)` for jobs that ran under `from`; `shift` moves
+    /// the machine positions a paused job is waiting at.
+    pub fn rebase_jobs(&self, zeros: Option<(Zeros, Zeros)>, shift: [f64; 3]) -> Result<()> {
+        for mut job in self.list()? {
+            let mut changed = false;
+            if let Some((from, to)) = zeros
+                && let Some(work) = job.work_offsets.as_mut()
+                && !position::zeros_differ(work.zeros, from)
+            {
+                work.zeros = to;
+                changed = true;
+            }
+            if job.state == JobState::Paused
+                && let Some(point) = job.paused_at.as_mut()
+            {
+                point.position = position::add(point.position, shift);
+                point.lifted_to = point.lifted_to.map(|z| z + shift[2]);
+                changed = true;
+            }
+            if changed {
+                self.save(&job)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn create(&self, name: Option<String>, source: &str) -> Result<JobRecord> {
         let id = Uuid::new_v4().to_string();
-        let dir = self.root.join(&id);
-        std::fs::create_dir_all(&dir)?;
-        write_atomic(&dir.join("program.gcode"), source.as_bytes())?;
+        let staging = self.root.join(format!("{STAGING_PREFIX}{id}"));
+        std::fs::create_dir(&staging)?;
+        write_atomic(&staging.join("program.gcode"), source.as_bytes())?;
         let record = JobRecord {
             name: name.unwrap_or_else(|| id.clone()),
-            id,
+            id: id.clone(),
             state: JobState::Loaded,
             total_lines: program::prepare(source).len(),
             acked_lines: 0,
@@ -178,8 +247,14 @@ impl JobStore {
             work_offset: None,
             reason: None,
             line_errors: Vec::new(),
+            lift_pending: None,
         };
-        self.save(&record)?;
+        write_atomic(
+            &staging.join("job.json"),
+            &serde_json::to_vec_pretty(&record)?,
+        )?;
+        std::fs::rename(&staging, self.root.join(&id))?;
+        sync_dir(&self.root)?;
         Ok(record)
     }
 
@@ -206,12 +281,18 @@ impl JobStore {
         Ok(program::prepare(&source))
     }
 
+    /// Every readable job, oldest first. A record that cannot be read is
+    /// logged and left out rather than failing the whole list: one damaged
+    /// job must not keep the other jobs, or the server, from coming back.
     pub fn list(&self) -> Result<Vec<JobRecord>> {
         let mut jobs = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let name = entry?.file_name();
-            if let Some(job) = self.get(&name.to_string_lossy())? {
-                jobs.push(job);
+            let name = name.to_string_lossy();
+            match self.get(&name) {
+                Ok(Some(job)) => jobs.push(job),
+                Ok(None) => {}
+                Err(e) => warn!(job = %name, error = %e, "skipping unreadable job record"),
             }
         }
         jobs.sort_by_key(|j| j.created_at_ms);
@@ -233,12 +314,29 @@ impl JobStore {
     /// controller may have kept running buffered moves after we went away,
     /// so the job cannot simply continue.
     pub fn recover(&self) -> Result<Vec<JobRecord>> {
+        self.sweep_staging()?;
         let mut recovered = Vec::new();
         for mut job in self.list()? {
             // A pause that freed the machine is not an interrupted job.
-            let released_pause = job.state == JobState::Paused && job.paused_at.is_some();
-            if job.state.is_active() && !released_pause {
+            if job.state == JobState::Paused && job.paused_at.is_some() {
+                continue;
+            }
+            if job.state == JobState::Paused
+                && let Some(point) = job.lift_pending.take()
+            {
+                // The server stopped while the tool was being lifted. The
+                // lift may or may not have finished, so say so; resuming
+                // raises the tool to the height it was lifting to.
+                job.paused_at = Some(point);
+                job.reason = Some(
+                    "the server stopped while the tool was being lifted; resume raises it to the height it was lifting to"
+                        .into(),
+                );
+                self.save(&job)?;
+            } else if job.state.is_active() {
                 job.state = JobState::Interrupted;
+                job.lift_pending = None;
+                job.paused_at = None;
                 job.reason = Some("the server stopped while the job was active".into());
                 job.finished_at_ms = Some(now_ms());
                 self.save(&job)?;
@@ -247,13 +345,174 @@ impl JobStore {
         }
         Ok(recovered)
     }
+
+    /// Removes job directories that were still being built when the last
+    /// server stopped. They never became jobs, so nothing is lost.
+    fn sweep_staging(&self) -> Result<()> {
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_PREFIX)
+            {
+                warn!(path = %entry.path().display(), "removing an unfinished job upload");
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
 }
 
+/// Replaces `path` with `bytes` so that a crash leaves either the old or the
+/// new contents, never a mix. The rename is made durable by syncing the
+/// directory that holds it.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir)?;
+    }
     Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open() -> (tempfile::TempDir, JobStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JobStore::open(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn a_pause_that_was_lifting_comes_back_paused_at_its_lift_height() {
+        let (_dir, store) = open();
+        let mut job = store.create(None, "G1 X1 F600\n").unwrap();
+        job.state = JobState::Paused;
+        job.lift_pending = Some(PausePoint {
+            position: [1.0, 2.0, -1.0],
+            lifted_to: Some(9.0),
+        });
+        store.save(&job).unwrap();
+
+        assert!(store.recover().unwrap().is_empty());
+
+        let job = store.get(&job.id).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Paused);
+        assert_eq!(job.lift_pending, None);
+        assert_eq!(
+            job.paused_at,
+            Some(PausePoint {
+                position: [1.0, 2.0, -1.0],
+                lifted_to: Some(9.0),
+            })
+        );
+    }
+
+    #[test]
+    fn a_hold_that_never_reached_its_lift_is_interrupted() {
+        let (_dir, store) = open();
+        let mut job = store.create(None, "G1 X1 F600\n").unwrap();
+        job.state = JobState::Paused;
+        store.save(&job).unwrap();
+
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        let job = store.get(&job.id).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Interrupted);
+        assert_eq!(job.paused_at, None);
+    }
+
+    #[test]
+    fn a_released_pause_is_left_alone() {
+        let (_dir, store) = open();
+        let mut job = store.create(None, "G1 X1 F600\n").unwrap();
+        job.state = JobState::Paused;
+        job.paused_at = Some(PausePoint {
+            position: [0.0; 3],
+            lifted_to: None,
+        });
+        store.save(&job).unwrap();
+
+        assert!(store.recover().unwrap().is_empty());
+        assert_eq!(store.get(&job.id).unwrap().unwrap().state, JobState::Paused);
+    }
+
+    #[test]
+    fn a_damaged_record_is_skipped_and_the_rest_are_listed() {
+        let (dir, store) = open();
+        let good = store.create(Some("good".into()), "G1 X1 F600\n").unwrap();
+        let bad = store.create(Some("bad".into()), "G1 X1 F600\n").unwrap();
+        std::fs::write(dir.path().join("jobs").join(&bad.id).join("job.json"), b"{").unwrap();
+
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, good.id);
+        assert!(store.recover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebasing_moves_stored_zeros_and_paused_positions_together() {
+        let (_dir, store) = open();
+        let shifted = [[-10.0, -20.0, -5.0]; 6];
+        let mut paused = store.create(None, "G1 X1 F600\n").unwrap();
+        paused.state = JobState::Paused;
+        paused.work_offsets = Some(WorkOffsets {
+            system: 54,
+            zeros: [[0.0; 3]; 6],
+        });
+        paused.paused_at = Some(PausePoint {
+            position: [1.0, 2.0, -1.0],
+            lifted_to: Some(9.0),
+        });
+        store.save(&paused).unwrap();
+        let mut other = store.create(None, "G1 X1 F600\n").unwrap();
+        other.work_offsets = Some(WorkOffsets {
+            system: 55,
+            zeros: [[5.0, 5.0, 5.0]; 6],
+        });
+        store.save(&other).unwrap();
+
+        store
+            .rebase_jobs(Some(([[0.0; 3]; 6], shifted)), [-10.0, -20.0, -5.0])
+            .unwrap();
+
+        let paused = store.get(&paused.id).unwrap().unwrap();
+        assert_eq!(paused.work_offsets.unwrap().zeros, shifted);
+        assert_eq!(
+            paused.paused_at,
+            Some(PausePoint {
+                position: [-9.0, -18.0, -6.0],
+                lifted_to: Some(4.0),
+            })
+        );
+        // A job that ran under other zeros is left as it was.
+        let other = store.get(&other.id).unwrap().unwrap();
+        assert_eq!(other.work_offsets.unwrap().zeros, [[5.0, 5.0, 5.0]; 6]);
+    }
+
+    #[test]
+    fn a_new_job_appears_only_once_complete() {
+        let (dir, store) = open();
+        let job = store.create(None, "G1 X1 F600\n").unwrap();
+
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path().join("jobs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, [job.id]);
+    }
 }

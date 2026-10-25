@@ -23,10 +23,11 @@ use tracing::{debug, info, warn};
 use crate::bounds::{self, Bounds};
 use crate::gcode::{self, Interpreter, Modal};
 use crate::grbl::{self, FirmwareKind, Response, Status, realtime};
+use crate::position::{self, Check, Position, Record};
 use crate::program::ProgramLine;
 use crate::settings::{PauseOptions, PauseSettings};
 use crate::store::{JobRecord, JobState, JobStore, LineError, PausePoint, now_ms};
-use crate::work::{self, WorkOffsets};
+use crate::work::{self, WorkOffsets, Zeros};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -79,6 +80,8 @@ pub struct MachineSnapshot {
     pub last_error: Option<String>,
     /// The freshest record of the active job, if any.
     pub active_job: Option<JobRecord>,
+    /// A recorded position the controller disagrees with, awaiting an answer.
+    pub position_check: Option<Check>,
 }
 
 #[derive(Debug)]
@@ -103,6 +106,7 @@ enum Command {
     Pause(String, PauseOptions, Reply<JobRecord>),
     Resume(String, ResumeOptions, Reply<JobRecord>),
     Stop(String, Reply<JobRecord>),
+    PositionCheck(bool, Reply<()>),
     Delete(String, Reply<()>),
     Machine(MachineAction, Reply<()>),
     Jog(JogRequest, Reply<()>),
@@ -270,6 +274,11 @@ impl ControllerHandle {
     pub async fn jog(&self, request: JogRequest) -> Result<(), ControlError> {
         self.call(|r| Command::Jog(request, r)).await
     }
+    /// Answers a position check: `moved` says whether the machine has moved
+    /// since the sender last recorded the tool's position.
+    pub async fn position_check(&self, moved: bool) -> Result<(), ControlError> {
+        self.call(|r| Command::PositionCheck(moved, r)).await
+    }
 }
 
 pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
@@ -286,7 +295,12 @@ pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
         alarm_message: None,
         last_error: None,
         active_job: None,
+        position_check: None,
     };
+    let position = store.position().unwrap_or_else(|e| {
+        warn!(error = %e, "cannot read the recorded tool position; starting without one");
+        Position::default()
+    });
     let (snap_tx, snap_rx) = watch::channel(snapshot.clone());
     let actor = Actor {
         config,
@@ -296,6 +310,9 @@ pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
         machine: snapshot,
         job: None,
         jog_target: None,
+        position,
+        pending: None,
+        last_position_save: Instant::now(),
     };
     tokio::spawn(actor.run());
     ControllerHandle {
@@ -362,6 +379,8 @@ enum Origin {
     Work,
     /// The jog that lifts the tool when a pause frees the machine.
     Lift,
+    /// A `G10` that moves the work zero to match the recorded position.
+    Sync,
     /// The `$#` and `$G` queries that read the work coordinate systems.
     Modes,
 }
@@ -438,6 +457,9 @@ struct Session {
     /// Set after a soft reset is sent; acknowledgements are meaningless
     /// until the controller prints its banner again.
     awaiting_reset: Option<Instant>,
+    /// The reported position has been compared with the recorded one on this
+    /// connection.
+    reconciled: bool,
     /// Set once the firmware has been identified.
     identified: bool,
     /// When the work coordinate systems were last asked for.
@@ -472,6 +494,30 @@ struct Actor {
     job: Option<ActiveJob>,
     /// Where the queued jogs will leave the tool, in machine coordinates.
     jog_target: Option<([f64; 3], Instant)>,
+    /// The recorded tool position and any check awaiting an answer.
+    position: Position,
+    /// A change to the position waiting for the controller to accept the
+    /// work zeros that go with it.
+    pending: Option<Pending>,
+    last_position_save: Instant,
+}
+
+/// A change waiting for the controller to accept its work zeros, one line
+/// per system.
+struct Pending {
+    change: Change,
+    outstanding: usize,
+}
+
+/// A change to the recorded position, applied once any zeros it needs have
+/// been accepted by the controller.
+struct Change {
+    /// The zeros to move from and to, if they move.
+    zeros: Option<(Zeros, Zeros)>,
+    /// How far the machine coordinates of paused jobs move with the frame.
+    shift: [f64; 3],
+    record: Record,
+    check: Option<Check>,
 }
 
 /// Grbl 1.1 ships with a 128 byte RX buffer, the smallest in the family.
@@ -555,7 +601,10 @@ impl Actor {
             Command::Delete(id, r) => {
                 let _ = r.send(self.delete(&id));
             }
-            Command::Machine(_, r) | Command::Jog(_, r) | Command::Work(_, _, r) => {
+            Command::Machine(_, r)
+            | Command::Jog(_, r)
+            | Command::Work(_, _, r)
+            | Command::PositionCheck(_, r) => {
                 let _ = r.send(Err(ControlError::Unavailable(
                     "the machine is not connected".into(),
                 )));
@@ -630,6 +679,7 @@ impl Actor {
             last_rx: Instant::now(),
             last_ack: Instant::now(),
             awaiting_reset: None,
+            reconciled: false,
             identified: false,
             modes_read_at: Instant::now(),
             modes: ModesProbe::default(),
@@ -831,6 +881,14 @@ impl Actor {
                     self.machine.alarm_message = None;
                 }
                 self.on_status(s, &status).await?;
+                if s.reconciled {
+                    self.record_position(&status);
+                } else if self.machine.ready
+                    && self.machine.work.is_some()
+                    && status.state == "Idle"
+                {
+                    self.reconcile(s, &status).await?;
+                }
                 self.machine.status = Some(status);
             }
             Response::Message { tag, body } => match tag.as_str() {
@@ -995,6 +1053,24 @@ impl Actor {
                     }
                 }
             }
+            Origin::Sync => match error {
+                None => {
+                    let done = self.pending.as_mut().is_some_and(|p| {
+                        p.outstanding = p.outstanding.saturating_sub(1);
+                        p.outstanding == 0
+                    });
+                    if done && let Some(pending) = self.pending.take() {
+                        self.commit(pending.change);
+                    }
+                }
+                Some(code) => {
+                    self.pending = None;
+                    self.machine.last_error = Some(format!(
+                        "the controller refused to move the work zeros: error {code}, {}",
+                        grbl::error_message(code)
+                    ));
+                }
+            },
             Origin::Work => {
                 if let Some(reply) = done.reply {
                     let _ = reply.send(match error {
@@ -1165,6 +1241,7 @@ impl Actor {
                         job.resume_pending = false;
                         // A stop outranks a pause that is still lifting.
                         job.lift_pause = None;
+                        job.record.lift_pending = None;
                     }
                     // Hold first so the machine decelerates instead of
                     // losing position; the reset follows on Hold:0.
@@ -1178,6 +1255,10 @@ impl Actor {
             }
             Command::Delete(id, reply) => {
                 let _ = reply.send(self.delete(&id));
+            }
+            Command::PositionCheck(moved, reply) => {
+                let result = self.answer_position_check(s, moved).await?;
+                let _ = reply.send(result);
             }
         }
         Ok(())
@@ -1269,6 +1350,9 @@ impl Actor {
 
     /// Refuses to start or resume unless the machine is ready for a job.
     fn check_ready(&self) -> Result<(), ControlError> {
+        if let Some(check) = self.position.check.as_ref().filter(|c| !c.adjusted) {
+            return Err(ControlError::Conflict(check.question.clone()));
+        }
         if let Some(active) = &self.job {
             return Err(ControlError::Conflict(format!(
                 "job {} is already active",
@@ -1992,6 +2076,17 @@ impl Actor {
         };
         match self.lift_target(lift) {
             Ok(Some(z)) => {
+                // Write down where the lift is headed before sending it. If
+                // the server stops mid-lift, the job is then still a paused
+                // job with a height to return the tool to, not an
+                // interrupted one with no idea where the tool is.
+                if let (Some(position), Some(job)) = (lift.position, self.job.as_mut()) {
+                    job.record.lift_pending = Some(PausePoint {
+                        position,
+                        lifted_to: Some(z),
+                    });
+                    self.save_progress(true);
+                }
                 // A jog is refused by the controller if it would leave the
                 // machine's travel, where a plain move raises an alarm.
                 let line = format!("$J=G21 G90 G53 Z{z:.3} F{LIFT_FEED:.3}");
@@ -2061,7 +2156,13 @@ impl Actor {
         };
         info!(id = %job.record.id, ?state, ?reason, "job finished");
         job.record.state = state;
+        // A lift that is not pending any more has either been released into
+        // `paused_at` or the job has ended.
+        job.record.lift_pending = None;
         if state != JobState::Paused {
+            // Only a released pause keeps a position: it is what a resume
+            // brings the tool back from.
+            job.record.paused_at = None;
             job.record.finished_at_ms = Some(now_ms());
         }
         if reason.is_some() {
@@ -2086,8 +2187,285 @@ impl Actor {
         job.last_saved = Instant::now();
     }
 
+    /// Records where the tool is, once a connection has been reconciled.
+    /// Writes are throttled while the machine moves, and not made while a
+    /// check is waiting, so the record keeps the position the operator is
+    /// being asked about.
+    fn record_position(&mut self, status: &Status) {
+        if self.pending.is_some() || self.position.check.as_ref().is_some_and(|c| !c.adjusted) {
+            return;
+        }
+        let (Some(machine), Some(zeros)) = (
+            machine_position(status),
+            self.machine.work.as_ref().map(|w| w.zeros),
+        ) else {
+            return;
+        };
+        if self.position.record.is_some_and(|r| {
+            !position::differs(r.machine, machine) && !position::zeros_differ(r.zeros, zeros)
+        }) {
+            return;
+        }
+        let at_rest = status.state == "Idle" || status.hold_complete();
+        if !at_rest && self.last_position_save.elapsed() < SAVE_INTERVAL {
+            return;
+        }
+        self.position.record = Some(Record { machine, zeros });
+        self.last_position_save = Instant::now();
+        self.save_position();
+    }
+
+    /// Compares the position the controller reports with the recorded one,
+    /// once per connection, when it is idle and its work zeros are known.
+    ///
+    /// The sender is the only thing that moves the machine, so a difference
+    /// means the controller lost its position (a reset, say) and not that the
+    /// tool moved. By default every work zero moves by the same amount, to
+    /// keep the tool where the record puts it, and the operator is asked
+    /// whether the machine moved. With `position.trust_record` off, jobs wait
+    /// for the answer instead.
+    async fn reconcile(&mut self, s: &mut Session, status: &Status) -> std::io::Result<()> {
+        let (Some(reported), Some(zeros)) = (
+            machine_position(status),
+            self.machine.work.as_ref().map(|w| w.zeros),
+        ) else {
+            return Ok(());
+        };
+        s.reconciled = true;
+        let agreed = |record: Record| Change {
+            zeros: None,
+            shift: [0.0; 3],
+            record: Record {
+                machine: reported,
+                zeros: record.zeros,
+            },
+            check: None,
+        };
+        let Some(record) = self.position.record else {
+            let change = Change {
+                zeros: None,
+                shift: [0.0; 3],
+                record: Record {
+                    machine: reported,
+                    zeros,
+                },
+                check: None,
+            };
+            return self.apply(s, change).await;
+        };
+        if !position::differs(record.machine, reported) {
+            let change = agreed(Record { zeros, ..record });
+            return self.apply(s, change).await;
+        }
+
+        let trust = match self.store.settings() {
+            Ok(settings) => settings.position.trust_record,
+            Err(e) => {
+                warn!(error = %e, "cannot read settings; trusting the recorded position");
+                true
+            }
+        };
+        let d = position::delta(record.machine, reported);
+        warn!(
+            recorded = %position::fmt(record.machine),
+            reported = %position::fmt(reported),
+            trust,
+            "the controller reports a different position than the one recorded"
+        );
+        let question = format!(
+            "The controller reports the tool at {}, but it was last recorded at {}. {} Has the machine moved since? Answer with POST /machine/position-check, {{\"moved\": true}} or {{\"moved\": false}}.",
+            position::fmt(reported),
+            position::fmt(record.machine),
+            if trust {
+                "The work zeros have been moved to keep the tool where it was recorded."
+            } else {
+                "Jobs wait until you answer."
+            }
+        );
+        let check = |zeros, adjusted| Check {
+            recorded: record.machine,
+            reported,
+            previous_zeros: record.zeros,
+            zeros,
+            adjusted,
+            question: question.clone(),
+        };
+        if trust {
+            let target = position::shift_zeros(record.zeros, d);
+            let change = Change {
+                zeros: Some((record.zeros, target)),
+                shift: d,
+                record: Record {
+                    machine: reported,
+                    zeros: target,
+                },
+                check: Some(check(target, true)),
+            };
+            self.apply(s, change).await
+        } else {
+            self.position.check = Some(check(zeros, false));
+            self.publish();
+            self.save_position();
+            Ok(())
+        }
+    }
+
+    /// Acts on the operator's answer to a position check.
+    async fn answer_position_check(
+        &mut self,
+        s: &mut Session,
+        moved: bool,
+    ) -> std::io::Result<Result<(), ControlError>> {
+        let Some(check) = self.position.check.clone() else {
+            return Ok(Err(ControlError::Conflict(
+                "there is no position check waiting for an answer".into(),
+            )));
+        };
+        if let Some(job) = &self.job {
+            return Ok(Err(ControlError::Conflict(format!(
+                "job {} is active; stop it first",
+                job.record.id
+            ))));
+        }
+        if self.pending.is_some() {
+            return Ok(Err(ControlError::Conflict(
+                "the work zeros are still being moved; try again in a moment".into(),
+            )));
+        }
+        let Some(status) = self.machine.status.clone() else {
+            return Ok(Err(ControlError::Unavailable(
+                "the machine position has not been reported yet".into(),
+            )));
+        };
+        if status.state != "Idle" {
+            return Ok(Err(ControlError::Conflict(format!(
+                "the machine is {}, not Idle",
+                status.state
+            ))));
+        }
+        let (Some(now), Some(zeros_now)) = (
+            machine_position(&status),
+            self.machine.work.as_ref().map(|w| w.zeros),
+        ) else {
+            return Ok(Err(ControlError::Unavailable(
+                "the machine position or work zeros have not been read yet".into(),
+            )));
+        };
+        let d = position::delta(check.recorded, check.reported);
+        let change = match (moved, check.adjusted) {
+            // Moved after the zeros were moved: put them back and take the
+            // report as it stands. The frame does not change.
+            (true, true) => Change {
+                zeros: Some((check.zeros, check.previous_zeros)),
+                shift: [0.0; 3],
+                record: Record {
+                    machine: now,
+                    zeros: check.previous_zeros,
+                },
+                check: None,
+            },
+            // Moved, with the zeros untouched: the report is the truth from
+            // here on, so the frame becomes the controller's.
+            (true, false) => Change {
+                zeros: None,
+                shift: d,
+                record: Record {
+                    machine: now,
+                    zeros: zeros_now,
+                },
+                check: None,
+            },
+            // Not moved, and the zeros were already moved: that stands.
+            (false, true) => Change {
+                zeros: None,
+                shift: [0.0; 3],
+                record: Record {
+                    machine: now,
+                    zeros: zeros_now,
+                },
+                check: None,
+            },
+            // Not moved: the record was right, so move the zeros to keep the
+            // tool where it is recorded.
+            (false, false) => {
+                let to = position::shift_zeros(check.previous_zeros, d);
+                Change {
+                    zeros: Some((check.previous_zeros, to)),
+                    shift: d,
+                    record: Record {
+                        machine: now,
+                        zeros: to,
+                    },
+                    check: None,
+                }
+            }
+        };
+        info!(moved, "position check answered");
+        self.apply(s, change).await?;
+        Ok(Ok(()))
+    }
+
+    /// Makes a change, sending the work zeros first when they move. The
+    /// record only changes once the controller has accepted every one.
+    async fn apply(&mut self, s: &mut Session, change: Change) -> std::io::Result<()> {
+        match change.zeros {
+            Some((_, to)) => {
+                let outstanding = to.len();
+                for (i, zero) in to.iter().enumerate() {
+                    // Millimetres and absolute mode go on each line, as they do
+                    // for the operator's work-zero changes.
+                    let line = format!(
+                        "G21 G90 G10 L2 P{} X{:.3} Y{:.3} Z{:.3}",
+                        i + 1,
+                        zero[0],
+                        zero[1],
+                        zero[2]
+                    );
+                    self.send_line(s, &line, Origin::Sync).await?;
+                }
+                self.pending = Some(Pending {
+                    change,
+                    outstanding,
+                });
+            }
+            None => self.commit(change),
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, change: Change) {
+        let moves = change.zeros.is_some() || change.shift != [0.0; 3];
+        if moves && let Err(e) = self.store.rebase_jobs(change.zeros, change.shift) {
+            warn!(error = %e, "cannot move the stored jobs to the new frame");
+        }
+        if let Some((_, to)) = change.zeros
+            && let Some(work) = self.machine.work.as_mut()
+        {
+            work.zeros = to;
+            let active = to[work::index(work.system).unwrap_or_default()];
+            if let Some(st) = self.machine.status.as_mut() {
+                st.work_offset = Some(active.to_vec());
+                st.work_position = None;
+            }
+        }
+        self.position = Position {
+            record: Some(change.record),
+            check: change.check,
+        };
+        self.last_position_save = Instant::now();
+        self.save_position();
+        self.publish();
+    }
+
+    fn save_position(&self) {
+        if let Err(e) = self.store.set_position(&self.position) {
+            warn!(error = %e, "cannot save the tool position");
+        }
+    }
+
     fn publish(&mut self) {
         self.machine.active_job = self.job.as_ref().map(|j| j.record.clone());
+        self.machine.position_check = self.position.check.clone();
         self.snapshot_tx.send_replace(self.machine.clone());
     }
 }
