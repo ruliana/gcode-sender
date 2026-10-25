@@ -6,7 +6,9 @@ mod http;
 mod program;
 mod settings;
 mod store;
+mod web;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +29,9 @@ struct Args {
     #[arg(long, env = "GCODE_SENDER_BAUD", default_value_t = 115_200)]
     baud: u32,
 
-    /// Address for the HTTP API. Use port 0 to pick a free port.
+    /// Address for the HTTP API and web UI, as an IP address and port. It
+    /// must be a loopback address: the sender only serves the machine it runs
+    /// on. Use port 0 to pick a free port.
     #[arg(long, env = "GCODE_SENDER_LISTEN", default_value = "127.0.0.1:8080")]
     listen: String,
 
@@ -70,6 +74,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
+    // The UI and the API are for the machine the controller is plugged into.
+    // Refuse anything that could be reached from elsewhere, before the serial
+    // port or the data directory is touched.
+    let listen: SocketAddr = args.listen.parse().with_context(|| {
+        format!(
+            "--listen {} must be an IP address and port, such as 127.0.0.1:8080",
+            args.listen
+        )
+    })?;
+    anyhow::ensure!(
+        listen.ip().is_loopback(),
+        "--listen must be a loopback address (127.0.0.1 or [::1]), not {listen}: \
+         the sender and its web UI only serve the machine they run on"
+    );
+
     let store = Arc::new(store::JobStore::open(&args.data_dir)?);
     for job in store.recover()? {
         warn!(id = %job.id, "job was active when the server last stopped; marked interrupted");
@@ -89,13 +108,14 @@ async fn main() -> anyhow::Result<()> {
         store.clone(),
     );
 
-    let listener = tokio::net::TcpListener::bind(&args.listen)
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
-        .with_context(|| format!("binding {}", args.listen))?;
+        .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
     info!(%addr, "HTTP API listening");
     // Printed on stdout so scripts and tests can find the port.
     println!("listening on {addr}");
+    info!("web UI at http://{addr}/");
 
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let app = http::router(http::AppState {

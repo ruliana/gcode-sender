@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>G-code Sender</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>G-code Sender</h1>
+    <span id="conn" class="pill bad">Starting</span>
+    <span id="port" class="muted"></span>
+    <span id="firmware" class="muted"></span>
+    <span id="live" class="muted">Connecting to events</span>
+  </header>
+
+  <div id="alarm" class="banner error" role="alert" hidden></div>
+  <div id="notice" class="banner error" role="alert" hidden></div>
+
+  <main class="layout">
+    <section class="card" aria-labelledby="machine-title">
+      <h2 id="machine-title">Machine</h2>
+      <dl class="facts">
+        <dt>State</dt><dd id="state">-</dd>
+        <dt>Machine</dt><dd id="mpos">-</dd>
+        <dt>Work</dt><dd id="wpos">-</dd>
+        <dt>Work offset (G54)</dt><dd id="woff">-</dd>
+        <dt>Feed</dt><dd id="feed">-</dd>
+      </dl>
+      <p id="last-error" class="muted" hidden></p>
+      <div class="row">
+        <button type="button" data-action="unlock" data-needs="ready">Unlock</button>
+        <button type="button" data-action="home" data-needs="ready">Home</button>
+        <button type="button" data-action="reset" data-needs="ready" class="danger">Soft reset</button>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="jog-title">
+      <h2 id="jog-title">Jog</h2>
+      <div class="jog-pad">
+        <button type="button" class="jog-yp" data-axis="Y" data-sign="1" data-needs="move">Y+</button>
+        <button type="button" class="jog-xm" data-axis="X" data-sign="-1" data-needs="move">X-</button>
+        <button type="button" class="jog-xp" data-axis="X" data-sign="1" data-needs="move">X+</button>
+        <button type="button" class="jog-ym" data-axis="Y" data-sign="-1" data-needs="move">Y-</button>
+      </div>
+      <div class="row">
+        <button type="button" data-axis="Z" data-sign="1" data-needs="move">Z+</button>
+        <button type="button" data-axis="Z" data-sign="-1" data-needs="move">Z-</button>
+      </div>
+      <div class="row">
+        <label>Step
+          <select id="jog-step">
+            <option value="0.1">0.1 mm</option>
+            <option value="1" selected>1 mm</option>
+            <option value="10">10 mm</option>
+            <option value="50">50 mm</option>
+          </select>
+        </label>
+        <label>Feed (mm/min)
+          <input id="jog-feed" type="number" min="1" step="100" value="1000">
+        </label>
+      </div>
+      <button type="button" id="jog-cancel" class="danger" data-needs="ready">Cancel jog</button>
+    </section>
+
+    <section class="card" aria-labelledby="zero-title">
+      <h2 id="zero-title">Work zero</h2>
+      <form id="zero-form">
+        <p class="muted">Call the tool's current position these coordinates. Leave an axis blank to leave it alone.</p>
+        <div class="row">
+          <label>X <input id="zero-x" type="number" step="any"></label>
+          <label>Y <input id="zero-y" type="number" step="any"></label>
+          <label>Z <input id="zero-z" type="number" step="any"></label>
+        </div>
+        <button type="submit" data-needs="move">Set work zero here</button>
+      </form>
+      <form id="offset-form">
+        <p class="muted">Put work zero (G54) at these machine coordinates. Leave an axis blank to leave it alone.</p>
+        <div class="row">
+          <label>X <input id="offset-x" type="number" step="any"></label>
+          <label>Y <input id="offset-y" type="number" step="any"></label>
+          <label>Z <input id="offset-z" type="number" step="any"></label>
+        </div>
+        <button type="submit" data-needs="move">Set work offset</button>
+      </form>
+    </section>
+
+    <section class="card wide" aria-labelledby="jobs-title">
+      <h2 id="jobs-title">Jobs</h2>
+      <form id="upload-form" class="row">
+        <input id="file" type="file" accept=".nc,.gc,.gcode,.ngc,.tap,.txt">
+        <button type="submit" id="upload-button">Upload program</button>
+      </form>
+      <ul id="job-list" class="job-list"></ul>
+
+      <div id="job-detail" class="job-detail" hidden>
+        <h3 id="job-title"></h3>
+        <div class="row">
+          <span id="job-state" class="badge"></span>
+          <span id="job-counts" class="muted"></span>
+        </div>
+        <progress id="job-progress" value="0" max="1"></progress>
+        <p id="job-reason" class="error-line" hidden></p>
+        <ul id="job-facts" class="facts-list"></ul>
+        <div class="row">
+          <button type="button" data-job-action="start" data-needs="start">Start</button>
+          <button type="button" data-job-action="pause" data-needs="pause">Pause and lift tool</button>
+          <button type="button" data-job-action="hold" data-needs="hold">Feed hold</button>
+          <button type="button" data-job-action="resume" data-needs="resume">Resume</button>
+          <button type="button" data-job-action="stop" data-needs="stop" class="danger">Stop</button>
+          <button type="button" data-job-action="delete" data-needs="delete">Delete</button>
+        </div>
+        <details class="resume-options">
+          <summary>Resume options</summary>
+          <div class="row">
+            <label>Retract to Z (mm)
+              <input id="resume-z" type="number" step="any">
+            </label>
+            <label>Spindle dwell (s)
+              <input id="resume-dwell" type="number" min="0" step="any">
+            </label>
+            <label>From file line
+              <input id="resume-line" type="number" min="0" step="1">
+            </label>
+            <label class="check">
+              <input id="resume-accept-zero" type="checkbox"> Accept a moved work zero
+            </label>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="settings-title">
+      <h2 id="settings-title">Pausing</h2>
+      <form id="settings-form">
+        <label class="check">
+          <input id="set-lift" type="checkbox"> Lift the tool when a job pauses
+        </label>
+        <label>Lift height (mm)
+          <input id="set-height" type="number" min="0" step="any">
+        </label>
+        <label>Lift to Z instead (mm, blank for none)
+          <input id="set-z" type="number" step="any">
+        </label>
+        <label>Spindle dwell on resume (s)
+          <input id="set-dwell" type="number" min="0" max="60" step="any">
+        </label>
+        <div class="row">
+          <button type="submit">Save pause settings</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="bounds-title">
+      <h2 id="bounds-title">Boundaries</h2>
+      <p class="muted">Machine coordinates, in mm. Leave an axis blank to leave it unchecked.</p>
+      <form id="bounds-form">
+        <div class="bounds">
+          <span></span><span class="muted">Min</span><span class="muted">Max</span>
+          <span>X</span>
+          <input id="bx-min" type="number" step="any" aria-label="X minimum">
+          <input id="bx-max" type="number" step="any" aria-label="X maximum">
+          <span>Y</span>
+          <input id="by-min" type="number" step="any" aria-label="Y minimum">
+          <input id="by-max" type="number" step="any" aria-label="Y maximum">
+          <span>Z</span>
+          <input id="bz-min" type="number" step="any" aria-label="Z minimum">
+          <input id="bz-max" type="number" step="any" aria-label="Z maximum">
+        </div>
+        <div class="row">
+          <button type="submit">Save boundaries</button>
+          <button type="button" id="bounds-clear" class="danger">Clear boundaries</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

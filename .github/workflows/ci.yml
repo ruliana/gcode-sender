@@ -18,3 +18,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Check the web UI parses
+        run: node --check web/app.js
