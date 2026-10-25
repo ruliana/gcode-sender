@@ -4,11 +4,13 @@
 //! machine's boundaries before any of it is sent.
 //!
 //! It understands what CAM output for routers uses: units, distance mode,
-//! planes, G0/G1/G2/G3/G38.x, G53, and the G54 work offset. Anything that
-//! changes where coordinates land in ways it cannot follow is reported as
-//! unsupported rather than guessed at.
+//! planes, G0/G1/G2/G3/G38.x, G53, and the work coordinate systems G54 to
+//! G59. Anything that changes where coordinates land in ways it cannot
+//! follow is reported as unsupported rather than guessed at.
 
 use std::f64::consts::{FRAC_PI_2, TAU};
+
+use crate::work::{self, Zeros};
 
 const MM_PER_INCH: f64 = 25.4;
 
@@ -138,8 +140,9 @@ pub struct Interpreter {
     motion: Motion,
     /// Position in machine coordinates, in millimetres.
     pub position: [f64; 3],
-    /// Where G54 zero is in machine coordinates, in millimetres.
-    offset: [f64; 3],
+    /// Where each work coordinate system's zero is in machine coordinates,
+    /// in millimetres, in the order of [`work::SYSTEMS`].
+    zeros: Zeros,
 }
 
 struct Word {
@@ -180,13 +183,33 @@ fn words(line: &str) -> Result<Vec<Word>, Unsupported> {
     Ok(out)
 }
 
+/// The work coordinate systems a line selects, such as `G55`. Lines that
+/// cannot be read select none.
+pub fn systems_selected(line: &str) -> Vec<u32> {
+    words(line)
+        .unwrap_or_default()
+        .iter()
+        .filter(|w| w.letter == 'G')
+        .map(|w| (w.value * 10.0).round() as i64)
+        .filter_map(|g| match g {
+            540..=590 if g % 10 == 0 => Some((g / 10) as u32),
+            _ => None,
+        })
+        .collect()
+}
+
 impl Interpreter {
-    pub fn new(position: [f64; 3], offset: [f64; 3]) -> Self {
+    /// Starts a program at `position` in machine coordinates, in work
+    /// coordinate `system`, with the zeros the controller has.
+    pub fn new(position: [f64; 3], zeros: Zeros, system: u32) -> Self {
         Self {
-            modal: Modal::default(),
+            modal: Modal {
+                wcs: system,
+                ..Modal::default()
+            },
             motion: Motion::Rapid,
             position,
-            offset,
+            zeros,
         }
     }
 
@@ -217,13 +240,12 @@ impl Interpreter {
                     200 => self.modal.inches = true,
                     210 => self.modal.inches = false,
                     530 => machine_coords = true,
-                    540 => self.modal.wcs = 54,
+                    540 | 550 | 560 | 570 | 580 | 590 => self.modal.wcs = (g / 10) as u32,
                     900 => self.modal.absolute = true,
                     910 => self.modal.absolute = false,
                     930 => self.modal.inverse_time = true,
                     940 => self.modal.inverse_time = false,
-                    280 | 281 | 300 | 301 | 100 | 920 | 921 | 922 | 923 | 550 | 560 | 570 | 580
-                    | 590 | 591 | 592 | 593 => {
+                    280 | 281 | 300 | 301 | 100 | 920 | 921 | 922 | 923 | 591 | 592 | 593 => {
                         return Err(Unsupported(format!("G{}", w.text)));
                     }
                     _ => {}
@@ -260,6 +282,9 @@ impl Interpreter {
         }
 
         let unit = self.unit();
+        let zero = work::index(self.modal.wcs)
+            .map(|i| self.zeros[i])
+            .unwrap_or_default();
         let start = self.position;
         let mut end = start;
         for i in 0..3 {
@@ -267,7 +292,7 @@ impl Interpreter {
                 end[i] = if machine_coords {
                     v * unit
                 } else if self.modal.absolute {
-                    v * unit + self.offset[i]
+                    v * unit + zero[i]
                 } else {
                     start[i] + v * unit
                 };
@@ -376,4 +401,59 @@ fn arc_extent(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G54 zero at X100, G55 zero at Y50, the others at the origin.
+    fn zeros() -> Zeros {
+        let mut z = [[0.0; 3]; 6];
+        z[0] = [100.0, 0.0, 0.0];
+        z[1] = [0.0, 50.0, 0.0];
+        z
+    }
+
+    #[test]
+    fn absolute_moves_use_the_selected_system() {
+        let mut m = Interpreter::new([0.0; 3], zeros(), 54);
+        m.step("G1 X10").unwrap();
+        assert_eq!(m.position, [110.0, 0.0, 0.0]);
+        m.step("G55 G1 Y5").unwrap();
+        assert_eq!(m.position, [110.0, 55.0, 0.0]);
+        m.step("G54 G1 X0").unwrap();
+        assert_eq!(m.position, [100.0, 55.0, 0.0]);
+    }
+
+    #[test]
+    fn a_program_starts_in_the_system_it_is_given() {
+        let mut m = Interpreter::new([0.0; 3], zeros(), 55);
+        assert_eq!(m.modal.wcs, 55);
+        m.step("G1 Y0").unwrap();
+        assert_eq!(m.position, [0.0, 50.0, 0.0]);
+    }
+
+    #[test]
+    fn machine_coordinates_ignore_the_system() {
+        let mut m = Interpreter::new([0.0; 3], zeros(), 55);
+        m.step("G53 G0 X10 Y10").unwrap();
+        assert_eq!(m.position, [10.0, 10.0, 0.0]);
+    }
+
+    #[test]
+    fn g59_point_offsets_are_unsupported() {
+        let mut m = Interpreter::new([0.0; 3], zeros(), 54);
+        assert!(m.step("G59.1 G1 X1").is_err());
+        assert!(m.step("G59.3").is_err());
+        m.step("G59 G1 X1").unwrap();
+        assert_eq!(m.modal.wcs, 59);
+    }
+
+    #[test]
+    fn systems_selected_lists_the_g5x_words() {
+        assert_eq!(systems_selected("G55 G1 X1 G58"), vec![55, 58]);
+        assert!(systems_selected("G1 X1").is_empty());
+        assert!(systems_selected("G59.1").is_empty());
+    }
 }

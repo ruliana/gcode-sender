@@ -6,6 +6,7 @@ mod http;
 mod program;
 mod settings;
 mod store;
+mod work;
 
 use std::path::PathBuf;
 use std::sync::Arc;
