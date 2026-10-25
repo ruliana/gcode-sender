@@ -6,22 +6,25 @@
 //! difference is not silently ignored: it becomes a check that the operator
 //! answers with `POST /machine/position-check`.
 //!
-//! When the record is trusted (the default), the work zero is moved to keep
-//! the tool where the record puts it. Every job's stored offset and paused
-//! position is moved with it, so resuming still lands in the same place.
+//! When the record is trusted (the default), every work zero (G54 to G59) is
+//! moved by the same amount, so each system still reads the tool where it was
+//! recorded. Stored jobs' zeros and paused positions move with them, so a
+//! resume still lands in the same place.
 
 use serde::{Deserialize, Serialize};
+
+use crate::work::Zeros;
 
 /// Differences up to this many millimetres count as the same position.
 pub const TOLERANCE: f64 = 0.01;
 
-/// The tool's position as last seen, with the G54 offset in effect then.
+/// The tool's position as last seen, with every work zero at that time.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// Machine coordinates of the tool.
     pub machine: [f64; 3],
-    /// The G54 offset, in machine coordinates.
-    pub work_offset: [f64; 3],
+    /// Each work coordinate system's zero, in machine coordinates.
+    pub zeros: Zeros,
 }
 
 /// A recorded position that the controller disagrees with, waiting for the
@@ -32,11 +35,11 @@ pub struct Check {
     pub recorded: [f64; 3],
     /// The position the controller reports now.
     pub reported: [f64; 3],
-    /// The G54 offset the record was made under.
-    pub previous_offset: [f64; 3],
-    /// The G54 offset in effect now.
-    pub offset: [f64; 3],
-    /// Whether the work zero has been moved to keep the tool where the record
+    /// The zeros the record was made under.
+    pub previous_zeros: Zeros,
+    /// The zeros in effect now.
+    pub zeros: Zeros,
+    /// Whether the zeros have been moved to keep the tool where the record
     /// puts it. Off, jobs wait until the operator answers.
     pub adjusted: bool,
     /// What to ask the operator.
@@ -54,6 +57,11 @@ pub fn differs(a: [f64; 3], b: [f64; 3]) -> bool {
     a.iter().zip(b).any(|(x, y)| (x - y).abs() > TOLERANCE)
 }
 
+/// Whether two sets of zeros are the same, system by system.
+pub fn zeros_differ(a: Zeros, b: Zeros) -> bool {
+    a.iter().zip(b).any(|(x, y)| differs(*x, y))
+}
+
 /// How far `to` is from `from`, per axis.
 pub fn delta(from: [f64; 3], to: [f64; 3]) -> [f64; 3] {
     [to[0] - from[0], to[1] - from[1], to[2] - from[2]]
@@ -63,8 +71,9 @@ pub fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-pub fn same_offset(a: [f64; 3], b: [f64; 3]) -> bool {
-    !differs(a, b)
+/// Every zero moved by the same amount.
+pub fn shift_zeros(zeros: Zeros, d: [f64; 3]) -> Zeros {
+    zeros.map(|z| add(z, d))
 }
 
 pub fn fmt(p: [f64; 3]) -> String {

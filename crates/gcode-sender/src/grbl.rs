@@ -52,7 +52,8 @@ pub struct Status {
     pub feed_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spindle_speed: Option<f64>,
-    /// The G54 work offset in machine coordinates, as last reported.
+    /// The active work coordinate system's offset in machine coordinates, as
+    /// last reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_offset: Option<Vec<f64>>,
 }
@@ -99,6 +100,25 @@ fn parse_banner(line: &str) -> Option<Response> {
     };
     let version = rest.split_whitespace().next()?.to_string();
     Some(Response::Banner { kind, version })
+}
+
+/// A `[G55:x,y,z]` line from `$#`: which work coordinate system's zero it
+/// gives, as an index into [`crate::work::SYSTEMS`], and the zero.
+pub fn work_zero_message(tag: &str, body: &str) -> Option<(usize, [f64; 3])> {
+    let index = crate::work::SYSTEMS
+        .iter()
+        .position(|s| tag.eq_ignore_ascii_case(&format!("G{s}")))?;
+    let v = parse_floats(body);
+    (v.len() >= 3).then(|| (index, [v[0], v[1], v[2]]))
+}
+
+/// The active work coordinate system from a `[GC:...]` line from `$G`, such
+/// as `G0 G55 G17 G21 ...`.
+pub fn active_system_message(body: &str) -> Option<u32> {
+    body.split_whitespace().find_map(|word| {
+        let number: u32 = word.strip_prefix('G')?.parse().ok()?;
+        crate::work::index(number).map(|_| number)
+    })
 }
 
 fn parse_floats(s: &str) -> Vec<f64> {

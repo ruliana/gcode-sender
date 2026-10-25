@@ -5,7 +5,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Harness, program_lines, wait_for};
+use common::{Harness, commands_sent, program_lines, wait_for};
 use grbl_sim::SimConfig;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -95,9 +95,9 @@ async fn pausing_lifts_the_tool_and_frees_the_machine() {
     assert_eq!(job["reason"], "paused on request; the tool was lifted");
 
     // Nothing more is sent to the controller.
-    let received = h.sim.received_lines().len();
+    let received = commands_sent(&h.sim).len();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(h.sim.received_lines().len(), received);
+    assert_eq!(commands_sent(&h.sim).len(), received);
 }
 
 #[tokio::test]
@@ -357,13 +357,13 @@ async fn stopping_a_paused_job_ends_it_without_touching_the_machine() {
     pause(&h, &id, json!({})).await;
     released(&h, &id).await;
     let resets = h.sim.soft_resets();
-    let received = h.sim.received_lines().len();
+    let received = commands_sent(&h.sim).len();
 
     let job = h.action(&id, "stop").await;
     assert_eq!(job["state"], "stopped");
     assert!(job["paused_at"].is_null());
     assert_eq!(h.sim.soft_resets(), resets);
-    assert_eq!(h.sim.received_lines().len(), received);
+    assert_eq!(commands_sent(&h.sim).len(), received);
 }
 
 #[tokio::test]
@@ -487,4 +487,99 @@ async fn program_lines_do_not_repeat_the_tool_commands_outside_the_return() {
         .filter(|l| l.starts_with("M3"))
         .count();
     assert_eq!(spindle_on, 2, "once at the start, once on the way back");
+}
+
+/// Sets the zero of `system` to machine coordinates `(x, y)`, and waits for
+/// the controller to report it.
+async fn set_zero(h: &Harness, system: &str, x: f64, y: f64) {
+    let (status, body) = h
+        .put_json(
+            "/machine/work-offset",
+            &json!({"x": x, "y": y, "system": system}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    h.wait_machine(&format!("the {system} zero"), |m| {
+        m["work"]["offsets"][system] == json!([x, y, 0.0])
+    })
+    .await;
+}
+
+/// The cutting program run in G55, with that zero at machine X100 Y50.
+async fn running_in_g55(h: &Harness, moves: usize) -> String {
+    set_zero(h, "G55", 100.0, 50.0).await;
+    let id = h.run(&format!("G55\n{}", cutting(moves))).await;
+    h.wait_job(&id, "progress", |j| j["acked_lines"].as_u64() > Some(40))
+        .await;
+    id
+}
+
+#[tokio::test]
+async fn a_pause_in_g55_lifts_and_resumes_in_its_own_zero() {
+    let h = Harness::start(slow()).await;
+    let id = running_in_g55(&h, 300).await;
+    let (status, job) = pause(&h, &id, json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+
+    let job = released(&h, &id).await;
+    // The pause point is in machine coordinates, so it is past the G55 zero.
+    let at = &job["paused_at"];
+    assert_eq!(at["position"][2], -1.0);
+    assert_eq!(at["lifted_to"], 9.0);
+    assert!(at["position"][0].as_f64().unwrap() > 100.0);
+
+    let (status, body) = h.post_json(&format!("/jobs/{id}/resume"), &json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    h.wait_job_state(&id, "completed").await;
+    // X300 Y0 in G55 is X400 Y50 in machine coordinates.
+    assert_eq!(h.sim.position(), [400.0, 50.0, -1.0]);
+    assert!(
+        h.sim
+            .received_lines()
+            .iter()
+            .any(|l| l == "G21 G90 G17 G55 G94"),
+        "resume did not restore G55"
+    );
+}
+
+#[tokio::test]
+async fn resuming_ignores_a_zero_the_program_does_not_use() {
+    let h = Harness::start(slow()).await;
+    let id = running_in_g55(&h, 300).await;
+    pause(&h, &id, json!({})).await;
+    released(&h, &id).await;
+
+    set_zero(&h, "G54", 3.0, 0.0).await;
+    let (status, body) = h.post_json(&format!("/jobs/{id}/resume"), &json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    h.wait_job_state(&id, "completed").await;
+}
+
+#[tokio::test]
+async fn resuming_refuses_a_moved_zero_the_program_uses_until_accepted() {
+    let h = Harness::start(slow()).await;
+    let id = running_in_g55(&h, 300).await;
+    pause(&h, &id, json!({})).await;
+    released(&h, &id).await;
+
+    set_zero(&h, "G55", 110.0, 50.0).await;
+    let (status, body) = h.post_json(&format!("/jobs/{id}/resume"), &json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("G55") && error.contains("accept_moved_zero"),
+        "{error}"
+    );
+    assert_eq!(h.job(&id).await["state"], "paused");
+
+    let (status, body) = h
+        .post_json(
+            &format!("/jobs/{id}/resume"),
+            &json!({"accept_moved_zero": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    h.wait_job_state(&id, "completed").await;
+    // X300 in G55 is now X410.
+    assert_eq!(h.sim.position(), [410.0, 50.0, -1.0]);
 }

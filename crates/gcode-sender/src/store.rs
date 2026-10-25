@@ -24,6 +24,7 @@ use crate::bounds::Bounds;
 use crate::position::{self, Position};
 use crate::program::{self, ProgramLine};
 use crate::settings::Settings;
+use crate::work::{WorkOffsets, Zeros};
 
 /// Prefix of the directories a job is built in before it is complete.
 const STAGING_PREFIX: &str = ".staging-";
@@ -98,7 +99,14 @@ pub struct JobRecord {
     pub lift_pending: Option<PausePoint>,
     /// The G54 work offset (machine coordinates) the job last ran with, so
     /// a resume can tell that the work zero has moved since.
+    /// The work coordinate system the job started in, and where every zero
+    /// was when it last ran. A resume checks the systems the program uses,
+    /// so it can tell that a zero has moved since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_offsets: Option<WorkOffsets>,
+    /// Written by versions that knew only G54: its zero, in machine
+    /// coordinates. Read so an old record still gets the G54 check.
+    #[serde(default, skip_serializing)]
     pub work_offset: Option<[f64; 3]>,
     /// Why the job paused, failed or was interrupted.
     pub reason: Option<String>,
@@ -194,15 +202,14 @@ impl JobStore {
     /// Moves the stored work offsets and paused positions to a new frame.
     /// `offset` is `(from, to)` for jobs that ran under `from`; `shift` moves
     /// the machine positions a paused job is waiting at.
-    pub fn rebase_jobs(&self, offset: Option<([f64; 3], [f64; 3])>, shift: [f64; 3]) -> Result<()> {
+    pub fn rebase_jobs(&self, zeros: Option<(Zeros, Zeros)>, shift: [f64; 3]) -> Result<()> {
         for mut job in self.list()? {
             let mut changed = false;
-            if let Some((from, to)) = offset
-                && job
-                    .work_offset
-                    .is_some_and(|o| position::same_offset(o, from))
+            if let Some((from, to)) = zeros
+                && let Some(work) = job.work_offsets.as_mut()
+                && !position::zeros_differ(work.zeros, from)
             {
-                job.work_offset = Some(to);
+                work.zeros = to;
                 changed = true;
             }
             if job.state == JobState::Paused
@@ -236,6 +243,7 @@ impl JobStore {
             finished_at_ms: None,
             resumed_from_line: None,
             paused_at: None,
+            work_offsets: None,
             work_offset: None,
             reason: None,
             line_errors: Vec::new(),
@@ -456,26 +464,33 @@ mod tests {
     }
 
     #[test]
-    fn rebasing_moves_stored_offsets_and_paused_positions_together() {
+    fn rebasing_moves_stored_zeros_and_paused_positions_together() {
         let (_dir, store) = open();
+        let shifted = [[-10.0, -20.0, -5.0]; 6];
         let mut paused = store.create(None, "G1 X1 F600\n").unwrap();
         paused.state = JobState::Paused;
-        paused.work_offset = Some([0.0, 0.0, 0.0]);
+        paused.work_offsets = Some(WorkOffsets {
+            system: 54,
+            zeros: [[0.0; 3]; 6],
+        });
         paused.paused_at = Some(PausePoint {
             position: [1.0, 2.0, -1.0],
             lifted_to: Some(9.0),
         });
         store.save(&paused).unwrap();
         let mut other = store.create(None, "G1 X1 F600\n").unwrap();
-        other.work_offset = Some([5.0, 5.0, 5.0]);
+        other.work_offsets = Some(WorkOffsets {
+            system: 55,
+            zeros: [[5.0, 5.0, 5.0]; 6],
+        });
         store.save(&other).unwrap();
 
         store
-            .rebase_jobs(Some(([0.0; 3], [-10.0, -20.0, -5.0])), [-10.0, -20.0, -5.0])
+            .rebase_jobs(Some(([[0.0; 3]; 6], shifted)), [-10.0, -20.0, -5.0])
             .unwrap();
 
         let paused = store.get(&paused.id).unwrap().unwrap();
-        assert_eq!(paused.work_offset, Some([-10.0, -20.0, -5.0]));
+        assert_eq!(paused.work_offsets.unwrap().zeros, shifted);
         assert_eq!(
             paused.paused_at,
             Some(PausePoint {
@@ -483,9 +498,9 @@ mod tests {
                 lifted_to: Some(4.0),
             })
         );
-        // A job that ran under a different offset is left as it was.
+        // A job that ran under other zeros is left as it was.
         let other = store.get(&other.id).unwrap().unwrap();
-        assert_eq!(other.work_offset, Some([5.0, 5.0, 5.0]));
+        assert_eq!(other.work_offsets.unwrap().zeros, [[5.0, 5.0, 5.0]; 6]);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! of a job or internal, goes through the same in-flight queue, because the
 //! controller acknowledges them all in order with `ok` or `error:N`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,12 +21,13 @@ use tokio_util::codec::{Decoder, FramedRead};
 use tracing::{debug, info, warn};
 
 use crate::bounds::{self, Bounds};
-use crate::gcode::{Interpreter, Modal};
+use crate::gcode::{self, Interpreter, Modal};
 use crate::grbl::{self, FirmwareKind, Response, Status, realtime};
 use crate::position::{self, Check, Position, Record};
 use crate::program::ProgramLine;
 use crate::settings::{PauseOptions, PauseSettings};
 use crate::store::{JobRecord, JobState, JobStore, LineError, PausePoint, now_ms};
+use crate::work::{self, WorkOffsets, Zeros};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -65,11 +66,15 @@ pub struct Firmware {
 pub struct MachineSnapshot {
     pub connection: Connection,
     pub port: String,
-    /// True once the firmware has been identified and jobs can start.
+    /// True once the firmware has been identified and the work coordinate
+    /// systems read, so jobs can start.
     pub ready: bool,
     pub firmware: Option<Firmware>,
     pub rx_buffer_size: Option<usize>,
     pub status: Option<Status>,
+    /// The work coordinate systems G54 to G59: which one is active, and
+    /// where each zero is. Read from the controller while it is idle.
+    pub work: Option<WorkOffsets>,
     pub alarm: Option<u32>,
     pub alarm_message: Option<String>,
     pub last_error: Option<String>,
@@ -151,13 +156,17 @@ pub enum MachineAction {
     JogCancel,
 }
 
-/// One number per axis; axes left out are not touched.
-#[derive(Clone, Copy, Debug, Deserialize)]
+/// One number per axis, and the system they apply to. Axes left out are
+/// not touched.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AxisValues {
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub z: Option<f64>,
+    /// The work coordinate system, `G54` to `G59`. Defaults to the active
+    /// one. `PUT /machine/work-system` takes only this.
+    pub system: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +175,8 @@ pub enum WorkChange {
     Zero,
     /// `G10 L2`: work coordinates start at these machine coordinates.
     Offset,
+    /// Makes a system the active one, which jogs and `G54`-style moves use.
+    Select,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -181,7 +192,7 @@ pub enum JogMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JogSpace {
-    /// Coordinates of the active work offset (G54).
+    /// Coordinates of the active work coordinate system.
     #[default]
     Work,
     /// Coordinates measured from the machine's home.
@@ -279,6 +290,7 @@ pub fn spawn(config: Config, store: Arc<JobStore>) -> ControllerHandle {
         firmware: None,
         rx_buffer_size: None,
         status: None,
+        work: None,
         alarm: None,
         alarm_message: None,
         last_error: None,
@@ -329,6 +341,28 @@ impl Decoder for LineDecoder {
     }
 }
 
+/// The replies to `$#` and `$G`, collected until both are in.
+#[derive(Default)]
+struct ModesProbe {
+    zeros: [Option<[f64; 3]>; 6],
+    system: Option<u32>,
+}
+
+impl ModesProbe {
+    /// The work coordinate systems, once every zero and the active system
+    /// have been reported.
+    fn complete(&self) -> Option<WorkOffsets> {
+        let mut zeros = [[0.0; 3]; 6];
+        for (slot, zero) in zeros.iter_mut().zip(self.zeros) {
+            *slot = zero?;
+        }
+        Some(WorkOffsets {
+            system: self.system?,
+            zeros,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     /// Index into the active job's lines.
@@ -347,6 +381,8 @@ enum Origin {
     Lift,
     /// A `G10` that moves the work zero to match the recorded position.
     Sync,
+    /// The `$#` and `$G` queries that read the work coordinate systems.
+    Modes,
 }
 
 struct InFlight {
@@ -424,6 +460,14 @@ struct Session {
     /// The reported position has been compared with the recorded one on this
     /// connection.
     reconciled: bool,
+    /// Set once the firmware has been identified.
+    identified: bool,
+    /// When the work coordinate systems were last asked for.
+    modes_read_at: Instant,
+    /// What `$#` and `$G` have reported so far, until a full set is read.
+    modes: ModesProbe,
+    /// Set when the work coordinate systems must be read again.
+    modes_stale: bool,
 }
 
 #[derive(Default)]
@@ -453,16 +497,23 @@ struct Actor {
     /// The recorded tool position and any check awaiting an answer.
     position: Position,
     /// A change to the position waiting for the controller to accept the
-    /// work offset that goes with it.
-    pending: Option<Change>,
+    /// work zeros that go with it.
+    pending: Option<Pending>,
     last_position_save: Instant,
 }
 
-/// A change to the recorded position, applied once any offset it needs has
+/// A change waiting for the controller to accept its work zeros, one line
+/// per system.
+struct Pending {
+    change: Change,
+    outstanding: usize,
+}
+
+/// A change to the recorded position, applied once any zeros it needs have
 /// been accepted by the controller.
 struct Change {
-    /// The G54 offset to move from and to, if it moves.
-    offset: Option<([f64; 3], [f64; 3])>,
+    /// The zeros to move from and to, if they move.
+    zeros: Option<(Zeros, Zeros)>,
     /// How far the machine coordinates of paused jobs move with the frame.
     shift: [f64; 3],
     record: Record,
@@ -476,6 +527,8 @@ const DEFAULT_PLANNER_BLOCKS: usize = 16;
 const INFO_RETRY: Duration = Duration::from_secs(1);
 const RESET_TIMEOUT: Duration = Duration::from_secs(3);
 const SAVE_INTERVAL: Duration = Duration::from_millis(250);
+/// How often the work coordinate systems are read again while idle.
+const MODES_REFRESH: Duration = Duration::from_secs(2);
 /// Feed for the lift jog. The controller caps it at the axis's maximum rate.
 const LIFT_FEED: f64 = 2000.0;
 /// Plunge feed on resume when the program has no plain feed rate to use.
@@ -514,6 +567,7 @@ impl Actor {
     fn disconnected(&mut self) {
         self.machine.connection = Connection::Disconnected;
         self.machine.ready = false;
+        self.machine.work = None;
         self.machine.status = None;
         if self.job.is_some() {
             let reason = self
@@ -626,6 +680,10 @@ impl Actor {
             last_ack: Instant::now(),
             awaiting_reset: None,
             reconciled: false,
+            identified: false,
+            modes_read_at: Instant::now(),
+            modes: ModesProbe::default(),
+            modes_stale: true,
         };
         self.machine.connection = Connection::Connected;
         self.machine.last_error = None;
@@ -699,7 +757,7 @@ impl Actor {
             }
         }
 
-        if !self.machine.ready
+        if !s.identified
             && s.awaiting_reset.is_none()
             && !s.inflight.iter().any(|f| f.origin == Origin::Info)
             && s.info.next_at.is_none_or(|t| now >= t)
@@ -711,6 +769,17 @@ impl Actor {
             s.info.next_at = Some(now + INFO_RETRY);
             debug!(attempt = s.info.attempts, "querying build info");
             self.send_line(s, "$I", Origin::Info).await?;
+        }
+
+        // Zeros can also change behind the server's back, from a panel or
+        // another client, so they are read again every so often while idle.
+        if s.identified
+            && self.job.is_none()
+            && s.awaiting_reset.is_none()
+            && !s.inflight.iter().any(|f| f.origin == Origin::Modes)
+            && (s.modes_stale || now.duration_since(s.modes_read_at) >= MODES_REFRESH)
+        {
+            self.read_modes(s).await?;
         }
 
         if let Some(sent) = s.awaiting_reset
@@ -766,6 +835,9 @@ impl Actor {
                     ..InfoProbe::default()
                 };
                 self.machine.ready = false;
+                s.identified = false;
+                s.modes_stale = true;
+                self.machine.work = None;
                 if s.awaiting_reset.is_some() {
                     self.after_reset(s).await?;
                 } else {
@@ -786,6 +858,13 @@ impl Actor {
                         .get_or_insert_with(Status::default)
                         .work_offset = Some(wco);
                 }
+                // The report gives the active system's zero, so it is always current.
+                if let (Some(work), Some(zero)) = (
+                    self.machine.work.as_mut(),
+                    three(status.work_offset.as_ref()),
+                ) {
+                    work.zeros[work::index(work.system).unwrap_or_default()] = zero;
+                }
                 let wco = self
                     .machine
                     .status
@@ -804,7 +883,10 @@ impl Actor {
                 self.on_status(s, &status).await?;
                 if s.reconciled {
                     self.record_position(&status);
-                } else if self.machine.ready && status.state == "Idle" {
+                } else if self.machine.ready
+                    && self.machine.work.is_some()
+                    && status.state == "Idle"
+                {
                     self.reconcile(s, &status).await?;
                 }
                 self.machine.status = Some(status);
@@ -823,7 +905,12 @@ impl Actor {
                 "FIRMWARE" if body.eq_ignore_ascii_case("grblhal") => {
                     s.info.kind = Some(FirmwareKind::Grblhal)
                 }
-                _ => {}
+                "GC" => s.modes.system = grbl::active_system_message(&body),
+                _ => {
+                    if let Some((i, zero)) = grbl::work_zero_message(&tag, &body) {
+                        s.modes.zeros[i] = Some(zero);
+                    }
+                }
             },
             Response::Other(_) => {}
         }
@@ -863,6 +950,16 @@ impl Actor {
         Ok(())
     }
 
+    /// Asks for the work coordinate systems: `$#` for the zeros, `$G` for
+    /// the active one. The answer is collected by `Origin::Modes`.
+    async fn read_modes(&mut self, s: &mut Session) -> std::io::Result<()> {
+        s.modes_stale = false;
+        s.modes_read_at = Instant::now();
+        s.modes = ModesProbe::default();
+        self.send_line(s, "$#", Origin::Modes).await?;
+        self.send_line(s, "$G", Origin::Modes).await
+    }
+
     async fn on_ack(&mut self, s: &mut Session, error: Option<u32>) -> std::io::Result<()> {
         if s.awaiting_reset.is_some() {
             return Ok(());
@@ -891,12 +988,29 @@ impl Actor {
                         version: s.info.version.clone().unwrap_or_default(),
                     });
                     self.machine.rx_buffer_size = Some(s.rx_buffer);
-                    self.machine.ready = true;
+                    // Jobs wait for the work coordinate systems too, so read them now.
+                    s.identified = true;
                     info!(?kind, rx_buffer = s.rx_buffer, "controller identified");
+                    self.read_modes(s).await?;
                 }
                 // Busy (error:8) or locked; the next tick asks again.
                 Some(code) => debug!(code, "build info query refused"),
             },
+            Origin::Modes => {
+                let batch_done = !s.inflight.iter().any(|f| f.origin == Origin::Modes);
+                match (error, s.modes.complete()) {
+                    (None, Some(work)) => {
+                        self.machine.work = Some(work);
+                        self.machine.ready = s.identified;
+                    }
+                    (None, None) if batch_done => s.modes_stale = true,
+                    (None, None) => {}
+                    (Some(code), _) => {
+                        debug!(code, "work coordinate query refused");
+                        s.modes_stale = true;
+                    }
+                }
+            }
             Origin::Internal => {
                 if let Some(code) = error {
                     warn!(code, "command rejected");
@@ -941,22 +1055,18 @@ impl Actor {
             }
             Origin::Sync => match error {
                 None => {
-                    if let Some(change) = self.pending.take() {
-                        // The controller has taken the new offset, so it is
-                        // the current one, even before its next report says so.
-                        if let (Some((_, to)), Some(st)) =
-                            (change.offset, self.machine.status.as_mut())
-                        {
-                            st.work_offset = Some(to.to_vec());
-                            st.work_position = None;
-                        }
-                        self.commit(change);
+                    let done = self.pending.as_mut().is_some_and(|p| {
+                        p.outstanding = p.outstanding.saturating_sub(1);
+                        p.outstanding == 0
+                    });
+                    if done && let Some(pending) = self.pending.take() {
+                        self.commit(pending.change);
                     }
                 }
                 Some(code) => {
                     self.pending = None;
                     self.machine.last_error = Some(format!(
-                        "the controller refused to move the work zero: error {code}, {}",
+                        "the controller refused to move the work zeros: error {code}, {}",
                         grbl::error_message(code)
                     ));
                 }
@@ -971,6 +1081,9 @@ impl Actor {
                                 st.work_offset = None;
                                 st.work_position = None;
                             }
+                            // Re-read the systems: the zero, or the active one, changed.
+                            s.modes_stale = true;
+                            self.machine.work = None;
                             Ok(())
                         }
                         Some(code) => {
@@ -1174,7 +1287,7 @@ impl Actor {
             .acked_lines
             .saturating_sub(s.planner_blocks + 1)
             .min(job.lines.len().saturating_sub(1));
-        let mut machine = Interpreter::new([0.0; 3], [0.0; 3]);
+        let mut machine = Interpreter::new([0.0; 3], [[0.0; 3]; 6], start_system(&job.record));
         for line in &job.lines[..index] {
             if let Err(e) = machine.step(&line.text) {
                 return Ok((
@@ -1207,6 +1320,7 @@ impl Actor {
             ));
         }
         self.check_program(s, &lines)?;
+        let work = self.work_offsets()?.clone();
         record.state = JobState::Running;
         record.total_lines = lines.len();
         record.acked_lines = 0;
@@ -1215,7 +1329,7 @@ impl Actor {
         record.finished_at_ms = None;
         record.resumed_from_line = None;
         record.paused_at = None;
-        record.work_offset = self.known_position().1;
+        record.work_offsets = Some(work);
         record.reason = None;
         record.line_errors.clear();
         self.store.save(&record)?;
@@ -1278,12 +1392,24 @@ impl Actor {
         let Some(limits) = self.store.bounds()? else {
             return Ok(());
         };
-        let (Some(position), Some(offset)) = self.known_position() else {
+        let Some(position) = self.known_position().0 else {
             return Err(ControlError::Unavailable(
-                "boundaries are set but the machine position or work offset has not been reported yet; try again".into(),
+                "boundaries are set but the machine position has not been reported yet; try again"
+                    .into(),
             ));
         };
-        bounds::check(&limits, lines, position, offset).map_err(ControlError::Invalid)
+        let work = self.work_offsets()?;
+        bounds::check(&limits, lines, position, work).map_err(ControlError::Invalid)
+    }
+
+    /// The work coordinate systems, once they have been read from the
+    /// controller.
+    fn work_offsets(&self) -> Result<&WorkOffsets, ControlError> {
+        self.machine.work.as_ref().ok_or_else(|| {
+            ControlError::Unavailable(
+                "the work coordinate systems have not been read yet; try again".into(),
+            )
+        })
     }
 
     /// Continues a job that ended early: interrupted by a lost connection,
@@ -1306,15 +1432,7 @@ impl Actor {
         self.check_ready()?;
         let lines = self.store.program(id)?;
         self.check_program(s, &lines)?;
-        if let (Some(then), (_, Some(now))) = (record.work_offset, self.known_position())
-            && then.iter().zip(now).any(|(a, b)| (a - b).abs() > 1e-3)
-            && !options.accept_moved_zero
-        {
-            return Err(ControlError::Conflict(format!(
-                "the work zero (G54) has moved since this job last ran: it was at machine X{:.3} Y{:.3} Z{:.3} and is now at X{:.3} Y{:.3} Z{:.3}, so resuming would cut in a different place; put the zero back, or set accept_moved_zero to resume anyway",
-                then[0], then[1], then[2], now[0], now[1], now[2]
-            )));
-        }
+        let work = self.work_offsets()?.clone();
 
         let index = match options.from_line {
             Some(from) => lines.iter().position(|l| l.number >= from).ok_or_else(|| {
@@ -1326,9 +1444,12 @@ impl Actor {
                 .min(lines.len().saturating_sub(1)),
         };
 
-        let (position, offset) = self.known_position();
-        let mut machine =
-            Interpreter::new(position.unwrap_or([0.0; 3]), offset.unwrap_or([0.0; 3]));
+        let (position, _) = self.known_position();
+        let mut machine = Interpreter::new(
+            position.unwrap_or([0.0; 3]),
+            work.zeros,
+            start_system(&record),
+        );
         for line in &lines[..index] {
             machine.step(&line.text).map_err(|e| {
                 ControlError::Invalid(format!(
@@ -1342,6 +1463,23 @@ impl Actor {
                 "the program is in incremental mode (G91) at line {}, so repeating lines is not safe; start the job again from the top",
                 lines[index].number
             )));
+        }
+
+        // Only the systems the rest of the program cuts in matter.
+        if !options.accept_moved_zero {
+            let used = systems_cut(&lines[index..], machine.modal.wcs);
+            for (system, then) in recorded_zeros(&record) {
+                let Some(now) = work.zero(system) else {
+                    continue;
+                };
+                if used.contains(&system) && then.iter().zip(now).any(|(a, b)| (a - b).abs() > 1e-3)
+                {
+                    return Err(ControlError::Conflict(format!(
+                        "the work zero (G{system}) has moved since this job last ran: it was at machine X{:.3} Y{:.3} Z{:.3} and is now at X{:.3} Y{:.3} Z{:.3}, so resuming would cut in a different place; put the zero back, or set accept_moved_zero to resume anyway",
+                        then[0], then[1], then[2], now[0], now[1], now[2]
+                    )));
+                }
+            }
         }
 
         // A pause that freed the machine promised to put the tool back.
@@ -1379,10 +1517,9 @@ impl Actor {
         let preamble = match &retract {
             None => machine.modal.preamble(),
             Some(retract) => {
-                let (Some(position), Some(_)) = (position, offset) else {
+                let Some(position) = position else {
                     return Err(ControlError::Unavailable(
-                        "the machine position or work offset has not been reported yet; try again"
-                            .into(),
+                        "the machine position has not been reported yet; try again".into(),
                     ));
                 };
                 self.retract_lines(retract, &machine.modal, machine.position, position[2])?
@@ -1394,7 +1531,11 @@ impl Actor {
         record.last_acked_line = index.checked_sub(1).map(|i| lines[i].number);
         record.resumed_from_line = Some(lines[index].number);
         record.paused_at = None;
-        record.work_offset = self.known_position().1.or(record.work_offset);
+        record.work_offsets = Some(WorkOffsets {
+            system: start_system(&record),
+            zeros: work.zeros,
+        });
+        record.work_offset = None;
         record.finished_at_ms = None;
         record.reason = None;
         self.store.save(&record)?;
@@ -1413,7 +1554,8 @@ impl Actor {
         Ok(record)
     }
 
-    /// The machine position and G54 offset from the latest status report.
+    /// The machine position and the active work offset from the latest
+    /// status report.
     fn known_position(&self) -> (Option<[f64; 3]>, Option<[f64; 3]>) {
         let status = self.machine.status.as_ref();
         (
@@ -1643,7 +1785,7 @@ impl Actor {
         values: AxisValues,
         reply: Reply<()>,
     ) -> std::io::Result<()> {
-        let line = match self.plan_work(s, change, values) {
+        let line = match self.plan_work(s, change, &values) {
             Ok(line) => line,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -1669,7 +1811,7 @@ impl Actor {
         &self,
         s: &Session,
         change: WorkChange,
-        values: AxisValues,
+        values: &AxisValues,
     ) -> Result<String, ControlError> {
         self.check_ready()?;
         if s.awaiting_reset.is_some() {
@@ -1682,24 +1824,49 @@ impl Actor {
                 "the machine state has not been reported yet".into(),
             ));
         }
+        let work = self.work_offsets()?;
         let axes = [values.x, values.y, values.z];
-        if axes.iter().all(Option::is_none) {
-            return Err(ControlError::Invalid(
-                "give at least one of x, y or z".into(),
-            ));
-        }
         if axes.iter().flatten().any(|v| !v.is_finite()) {
             return Err(ControlError::Invalid("x, y and z must be numbers".into()));
         }
-        let mut line = format!(
-            "G21 G90 G10 L{} P1",
-            if change == WorkChange::Zero { 20 } else { 2 }
-        );
-        for (name, v) in ["X", "Y", "Z"].iter().zip(axes) {
-            if let Some(v) = v {
-                line.push_str(&format!(" {name}{v:.3}"));
+        let system = match (&values.system, change) {
+            (None, WorkChange::Select) => {
+                return Err(ControlError::Invalid(
+                    "give the system to make active, G54 to G59".into(),
+                ));
             }
-        }
+            (Some(name), _) => work::parse_system(name).map_err(ControlError::Invalid)?,
+            (None, _) => work.system,
+        };
+        let line = match change {
+            WorkChange::Select => {
+                if axes.iter().any(Option::is_some) {
+                    return Err(ControlError::Invalid(
+                        "making a system active takes no x, y or z".into(),
+                    ));
+                }
+                format!("G21 G90 G{system}")
+            }
+            WorkChange::Zero | WorkChange::Offset => {
+                if axes.iter().all(Option::is_none) {
+                    return Err(ControlError::Invalid(
+                        "give at least one of x, y or z".into(),
+                    ));
+                }
+                // P1 is G54, P6 is G59.
+                let p = work::index(system).unwrap_or_default() + 1;
+                let mut line = format!(
+                    "G21 G90 G10 L{} P{p}",
+                    if change == WorkChange::Zero { 20 } else { 2 }
+                );
+                for (name, v) in ["X", "Y", "Z"].iter().zip(axes) {
+                    if let Some(v) = v {
+                        line.push_str(&format!(" {name}{v:.3}"));
+                    }
+                }
+                line
+            }
+        };
         if s.inflight_bytes + line.len() + 1 > self.capacity(s) {
             return Err(ControlError::Conflict(
                 "the controller is still busy with earlier commands; try again".into(),
@@ -2028,13 +2195,14 @@ impl Actor {
         if self.pending.is_some() || self.position.check.as_ref().is_some_and(|c| !c.adjusted) {
             return;
         }
-        let (Some(machine), Some(offset)) =
-            (machine_position(status), three(status.work_offset.as_ref()))
-        else {
+        let (Some(machine), Some(zeros)) = (
+            machine_position(status),
+            self.machine.work.as_ref().map(|w| w.zeros),
+        ) else {
             return;
         };
         if self.position.record.is_some_and(|r| {
-            !position::differs(r.machine, machine) && position::same_offset(r.work_offset, offset)
+            !position::differs(r.machine, machine) && !position::zeros_differ(r.zeros, zeros)
         }) {
             return;
         }
@@ -2042,62 +2210,52 @@ impl Actor {
         if !at_rest && self.last_position_save.elapsed() < SAVE_INTERVAL {
             return;
         }
-        self.position.record = Some(Record {
-            machine,
-            work_offset: offset,
-        });
+        self.position.record = Some(Record { machine, zeros });
         self.last_position_save = Instant::now();
         self.save_position();
     }
 
     /// Compares the position the controller reports with the recorded one,
-    /// once per connection, when it is idle and its work offset is known.
+    /// once per connection, when it is idle and its work zeros are known.
     ///
     /// The sender is the only thing that moves the machine, so a difference
     /// means the controller lost its position (a reset, say) and not that the
-    /// tool moved. By default the work zero moves to keep the tool where the
-    /// record puts it, and the operator is asked whether the machine moved.
-    /// With `position.trust_record` off, jobs wait for the answer instead.
+    /// tool moved. By default every work zero moves by the same amount, to
+    /// keep the tool where the record puts it, and the operator is asked
+    /// whether the machine moved. With `position.trust_record` off, jobs wait
+    /// for the answer instead.
     async fn reconcile(&mut self, s: &mut Session, status: &Status) -> std::io::Result<()> {
-        let (Some(reported), Some(offset)) =
-            (machine_position(status), three(status.work_offset.as_ref()))
-        else {
+        let (Some(reported), Some(zeros)) = (
+            machine_position(status),
+            self.machine.work.as_ref().map(|w| w.zeros),
+        ) else {
             return Ok(());
         };
         s.reconciled = true;
-        let Some(record) = self.position.record else {
-            let record = Record {
+        let agreed = |record: Record| Change {
+            zeros: None,
+            shift: [0.0; 3],
+            record: Record {
                 machine: reported,
-                work_offset: offset,
+                zeros: record.zeros,
+            },
+            check: None,
+        };
+        let Some(record) = self.position.record else {
+            let change = Change {
+                zeros: None,
+                shift: [0.0; 3],
+                record: Record {
+                    machine: reported,
+                    zeros,
+                },
+                check: None,
             };
-            return self
-                .apply(
-                    s,
-                    Change {
-                        offset: None,
-                        shift: [0.0; 3],
-                        record,
-                        check: None,
-                    },
-                )
-                .await;
+            return self.apply(s, change).await;
         };
         if !position::differs(record.machine, reported) {
-            let record = Record {
-                machine: reported,
-                work_offset: offset,
-            };
-            return self
-                .apply(
-                    s,
-                    Change {
-                        offset: None,
-                        shift: [0.0; 3],
-                        record,
-                        check: None,
-                    },
-                )
-                .await;
+            let change = agreed(Record { zeros, ..record });
+            return self.apply(s, change).await;
         }
 
         let trust = match self.store.settings() {
@@ -2119,33 +2277,33 @@ impl Actor {
             position::fmt(reported),
             position::fmt(record.machine),
             if trust {
-                "The work zero has been moved to keep the tool where it was recorded."
+                "The work zeros have been moved to keep the tool where it was recorded."
             } else {
                 "Jobs wait until you answer."
             }
         );
-        let check = |offset, adjusted| Check {
+        let check = |zeros, adjusted| Check {
             recorded: record.machine,
             reported,
-            previous_offset: record.work_offset,
-            offset,
+            previous_zeros: record.zeros,
+            zeros,
             adjusted,
             question: question.clone(),
         };
         if trust {
-            let target = position::add(record.work_offset, d);
+            let target = position::shift_zeros(record.zeros, d);
             let change = Change {
-                offset: Some((record.work_offset, target)),
+                zeros: Some((record.zeros, target)),
                 shift: d,
                 record: Record {
                     machine: reported,
-                    work_offset: target,
+                    zeros: target,
                 },
                 check: Some(check(target, true)),
             };
             self.apply(s, change).await
         } else {
-            self.position.check = Some(check(offset, false));
+            self.position.check = Some(check(zeros, false));
             self.publish();
             self.save_position();
             Ok(())
@@ -2171,7 +2329,7 @@ impl Actor {
         }
         if self.pending.is_some() {
             return Ok(Err(ControlError::Conflict(
-                "the work zero is still being moved; try again in a moment".into(),
+                "the work zeros are still being moved; try again in a moment".into(),
             )));
         }
         let Some(status) = self.machine.status.clone() else {
@@ -2185,58 +2343,58 @@ impl Actor {
                 status.state
             ))));
         }
-        let (Some(now), Some(offset_now)) = (
+        let (Some(now), Some(zeros_now)) = (
             machine_position(&status),
-            three(status.work_offset.as_ref()),
+            self.machine.work.as_ref().map(|w| w.zeros),
         ) else {
             return Ok(Err(ControlError::Unavailable(
-                "the machine position or work offset has not been reported yet".into(),
+                "the machine position or work zeros have not been read yet".into(),
             )));
         };
         let d = position::delta(check.recorded, check.reported);
         let change = match (moved, check.adjusted) {
-            // Moved after the work zero was moved: put the work zero back and
-            // take the report as it stands. The frame does not change.
+            // Moved after the zeros were moved: put them back and take the
+            // report as it stands. The frame does not change.
             (true, true) => Change {
-                offset: Some((check.offset, check.previous_offset)),
+                zeros: Some((check.zeros, check.previous_zeros)),
                 shift: [0.0; 3],
                 record: Record {
                     machine: now,
-                    work_offset: check.previous_offset,
+                    zeros: check.previous_zeros,
                 },
                 check: None,
             },
-            // Moved, with the work zero untouched: the report is the truth
-            // from here on, so the frame becomes the controller's.
+            // Moved, with the zeros untouched: the report is the truth from
+            // here on, so the frame becomes the controller's.
             (true, false) => Change {
-                offset: None,
+                zeros: None,
                 shift: d,
                 record: Record {
                     machine: now,
-                    work_offset: offset_now,
+                    zeros: zeros_now,
                 },
                 check: None,
             },
-            // Not moved, and the work zero was already moved: that stands.
+            // Not moved, and the zeros were already moved: that stands.
             (false, true) => Change {
-                offset: None,
+                zeros: None,
                 shift: [0.0; 3],
                 record: Record {
                     machine: now,
-                    work_offset: offset_now,
+                    zeros: zeros_now,
                 },
                 check: None,
             },
-            // Not moved: the record was right, so move the work zero to keep
-            // the tool where it is recorded.
+            // Not moved: the record was right, so move the zeros to keep the
+            // tool where it is recorded.
             (false, false) => {
-                let to = position::add(check.previous_offset, d);
+                let to = position::shift_zeros(check.previous_zeros, d);
                 Change {
-                    offset: Some((check.previous_offset, to)),
+                    zeros: Some((check.previous_zeros, to)),
                     shift: d,
                     record: Record {
                         machine: now,
-                        work_offset: to,
+                        zeros: to,
                     },
                     check: None,
                 }
@@ -2247,19 +2405,28 @@ impl Actor {
         Ok(Ok(()))
     }
 
-    /// Makes a change, sending the work offset first when it moves. The
-    /// record only changes once the controller has accepted the offset.
+    /// Makes a change, sending the work zeros first when they move. The
+    /// record only changes once the controller has accepted every one.
     async fn apply(&mut self, s: &mut Session, change: Change) -> std::io::Result<()> {
-        match change.offset {
+        match change.zeros {
             Some((_, to)) => {
-                // Millimetres and absolute mode go on the same line, as they
-                // do for the operator's work-offset changes.
-                let line = format!(
-                    "G21 G90 G10 L2 P1 X{:.3} Y{:.3} Z{:.3}",
-                    to[0], to[1], to[2]
-                );
-                self.send_line(s, &line, Origin::Sync).await?;
-                self.pending = Some(change);
+                let outstanding = to.len();
+                for (i, zero) in to.iter().enumerate() {
+                    // Millimetres and absolute mode go on each line, as they do
+                    // for the operator's work-zero changes.
+                    let line = format!(
+                        "G21 G90 G10 L2 P{} X{:.3} Y{:.3} Z{:.3}",
+                        i + 1,
+                        zero[0],
+                        zero[1],
+                        zero[2]
+                    );
+                    self.send_line(s, &line, Origin::Sync).await?;
+                }
+                self.pending = Some(Pending {
+                    change,
+                    outstanding,
+                });
             }
             None => self.commit(change),
         }
@@ -2267,9 +2434,19 @@ impl Actor {
     }
 
     fn commit(&mut self, change: Change) {
-        let moves = change.offset.is_some() || change.shift != [0.0; 3];
-        if moves && let Err(e) = self.store.rebase_jobs(change.offset, change.shift) {
+        let moves = change.zeros.is_some() || change.shift != [0.0; 3];
+        if moves && let Err(e) = self.store.rebase_jobs(change.zeros, change.shift) {
             warn!(error = %e, "cannot move the stored jobs to the new frame");
+        }
+        if let Some((_, to)) = change.zeros
+            && let Some(work) = self.machine.work.as_mut()
+        {
+            work.zeros = to;
+            let active = to[work::index(work.system).unwrap_or_default()];
+            if let Some(st) = self.machine.status.as_mut() {
+                st.work_offset = Some(active.to_vec());
+                st.work_position = None;
+            }
         }
         self.position = Position {
             record: Some(change.record),
@@ -2303,6 +2480,35 @@ pub fn state_name(state: JobState) -> String {
 /// Whether a pause is lifting the tool, for the job as it stands.
 fn lift_planned(job: &Option<ActiveJob>) -> bool {
     job.as_ref().is_some_and(|j| j.lift_pause.is_some())
+}
+
+/// The work coordinate system a job started in. Records from before
+/// several systems were supported only ever used G54.
+fn start_system(record: &JobRecord) -> u32 {
+    record.work_offsets.as_ref().map_or(54, |w| w.system)
+}
+
+/// The zeros a job last ran with, in machine coordinates, by system.
+fn recorded_zeros(record: &JobRecord) -> Vec<(u32, [f64; 3])> {
+    match (&record.work_offsets, record.work_offset) {
+        (Some(work), _) => work::SYSTEMS
+            .iter()
+            .filter_map(|&s| work.zero(s).map(|z| (s, z)))
+            .collect(),
+        (None, Some(zero)) => vec![(54, zero)],
+        (None, None) => Vec::new(),
+    }
+}
+
+/// The systems a run of lines cuts in: the one active when it starts, and
+/// each one a line selects.
+fn systems_cut(lines: &[ProgramLine], active: u32) -> BTreeSet<u32> {
+    let mut used: BTreeSet<u32> = lines
+        .iter()
+        .flat_map(|l| gcode::systems_selected(&l.text))
+        .collect();
+    used.insert(active);
+    used
 }
 
 /// The machine position of a status report, which may give the work

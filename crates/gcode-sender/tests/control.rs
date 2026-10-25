@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Harness, zigzag};
+use common::{Harness, commands_sent, zigzag};
 use grbl_sim::SimConfig;
 use reqwest::StatusCode;
 
@@ -36,11 +36,11 @@ async fn pause_holds_machine_and_stops_sending() {
     assert!(h.sim.realtime_bytes().contains(&b'!'));
 
     let position = h.sim.position();
-    let received = h.sim.received_lines().len();
+    let received = commands_sent(&h.sim).len();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(h.sim.position(), position, "the machine moved while paused");
     assert_eq!(
-        h.sim.received_lines().len(),
+        commands_sent(&h.sim).len(),
         received,
         "lines were sent while paused"
     );

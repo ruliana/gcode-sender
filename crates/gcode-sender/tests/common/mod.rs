@@ -346,6 +346,15 @@ pub fn zigzag_file_line(index: usize) -> usize {
 }
 
 /// Lines the controller was sent that are part of a program, not queries.
+/// What was sent to the controller, leaving out the work coordinate reads
+/// (`$#` and `$G`) the server makes on its own while idle. They move nothing.
+pub fn commands_sent(sim: &Simulator) -> Vec<String> {
+    sim.received_lines()
+        .into_iter()
+        .filter(|l| l != "$#" && l != "$G")
+        .collect()
+}
+
 pub fn program_lines(sim: &Simulator) -> Vec<String> {
     sim.received_lines()
         .into_iter()
