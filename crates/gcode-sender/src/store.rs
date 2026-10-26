@@ -380,7 +380,7 @@ impl JobStore {
 /// Replaces `path` with `bytes` so that a crash leaves either the old or the
 /// new contents, never a mix. The rename is made durable by syncing the
 /// directory that holds it.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(bytes)?;

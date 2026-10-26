@@ -19,6 +19,17 @@
   <!-- Shown until the page has started, and if it never does. -->
   <p class="boot" x-show="false">Starting the control panel. If this stays, the page could not run its scripts.</p>
 
+  <!-- Shown to a browser on another computer until it pairs with the code on the sender's screen. -->
+  <section class="pair-gate" role="dialog" aria-modal="true" aria-labelledby="pair-title" x-show="access === 'none'" x-cloak>
+    <form class="pair-card" @submit.prevent="pair()">
+      <h2 id="pair-title">Pair this browser</h2>
+      <p>Enter the six digits shown on the sender's screen.</p>
+      <input class="pair-input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-label="Pairing code" placeholder="000 000" x-model="pairCode" :disabled="pairBusy">
+      <p class="pair-error" role="alert" x-show="pairError" x-text="pairError"></p>
+      <button type="submit" class="btn primary big" :disabled="pairBusy">Pair</button>
+    </form>
+  </section>
+
   <header class="plate" x-cloak>
     <div class="brand">
       <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
@@ -279,6 +290,7 @@
         <button type="button" role="tab" :aria-selected="setupTab === 'zero' ? 'true' : 'false'" @click="setupTab = 'zero'">Work zero</button>
         <button type="button" role="tab" :aria-selected="setupTab === 'settings' ? 'true' : 'false'" @click="setupTab = 'settings'">Settings</button>
         <button type="button" role="tab" :aria-selected="setupTab === 'bounds' ? 'true' : 'false'" @click="setupTab = 'bounds'">Boundaries</button>
+        <button type="button" role="tab" x-show="access === 'local'" :aria-selected="setupTab === 'remote' ? 'true' : 'false'" @click="showPairing()">Remote access</button>
       </div>
 
       <div class="tab-body" role="tabpanel" x-show="setupTab === 'zero'">
@@ -370,6 +382,28 @@
             <button type="button" class="btn danger" @click="clearBounds()" :disabled="isBusy('boundsClear')">Clear boundaries</button>
           </div>
         </form>
+      </div>
+
+      <div class="tab-body" role="tabpanel" x-show="setupTab === 'remote'">
+        <p class="help">Other computers reach this sender by entering this code in their browser. A code works for five minutes, and five wrong tries use it up.</p>
+        <p class="pair-code" x-text="pairingCode" aria-label="Pairing code"></p>
+        <div class="button-row">
+          <span class="pair-note" x-text="pairingNote"></span>
+          <button type="button" class="btn small" @click="newPairingCode()" :disabled="isBusy('pairingNew')">New code</button>
+        </div>
+        <h3 class="pair-heading">Paired browsers</h3>
+        <p class="help" x-show="!hasPairedDevices">None yet.</p>
+        <table class="systems" x-show="hasPairedDevices">
+          <tbody>
+            <template x-for="d in pairedDevices" :key="d.id">
+              <tr>
+                <th x-text="d.name" :title="d.agent"></th>
+                <td x-text="'paired ' + d.when"></td>
+                <td><button type="button" class="btn small danger" @click="revokeDevice(d.id)" :disabled="isBusy('revoke')">Revoke</button></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
       </div>
     </section>
     </div>

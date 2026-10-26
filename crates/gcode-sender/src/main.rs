@@ -3,6 +3,7 @@ mod controller;
 mod gcode;
 mod grbl;
 mod http;
+mod pairing;
 mod position;
 mod program;
 mod settings;
@@ -31,10 +32,11 @@ struct Args {
     #[arg(long, env = "GCODE_SENDER_BAUD", default_value_t = 115_200)]
     baud: u32,
 
-    /// Address for the HTTP API and web UI, as an IP address and port. It
-    /// must be a loopback address: the sender only serves the machine it runs
-    /// on. Use port 0 to pick a free port.
-    #[arg(long, env = "GCODE_SENDER_LISTEN", default_value = "127.0.0.1:8080")]
+    /// Address for the HTTP API and web UI, as an IP address and port. Use
+    /// 127.0.0.1 to serve only this machine. Other computers reach the sender
+    /// by pairing a browser with the code shown on its screen. Use port 0 to
+    /// pick a free port.
+    #[arg(long, env = "GCODE_SENDER_LISTEN", default_value = "0.0.0.0:8080")]
     listen: String,
 
     /// Where jobs are stored. Everything needed after a restart lives here.
@@ -76,24 +78,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    // The UI and the API are for the machine the controller is plugged into.
-    // Refuse anything that could be reached from elsewhere, before the serial
-    // port or the data directory is touched.
     let listen: SocketAddr = args.listen.parse().with_context(|| {
         format!(
-            "--listen {} must be an IP address and port, such as 127.0.0.1:8080",
+            "--listen {} must be an IP address and port, such as 0.0.0.0:8080",
             args.listen
         )
     })?;
-    anyhow::ensure!(
-        listen.ip().is_loopback(),
-        "--listen must be a loopback address (127.0.0.1 or [::1]), not {listen}: \
-         the sender and its web UI only serve the machine they run on"
-    );
 
     let store = Arc::new(store::JobStore::open(&args.data_dir)?);
     for job in store.recover()? {
         warn!(id = %job.id, "job was active when the server last stopped; marked interrupted");
+    }
+    let pairing = Arc::new(pairing::Pairing::open(&args.data_dir)?);
+    if !listen.ip().is_loopback() {
+        let code = pairing.view().code;
+        info!("other computers can pair with the code {code} (shown on this machine's page)");
     }
 
     let controller = controller::spawn(
@@ -123,14 +122,18 @@ async fn main() -> anyhow::Result<()> {
     let app = http::router(http::AppState {
         store,
         controller,
+        pairing,
         shutdown,
     });
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            // Event streams never end on their own.
-            let _ = stop.send(true);
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        // Event streams never end on their own.
+        let _ = stop.send(true);
+    })
+    .await?;
     Ok(())
 }

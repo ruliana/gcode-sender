@@ -54,6 +54,17 @@
   // Before the page is drawn, so it does not flash the other theme.
   applyTheme(remembered("theme", "auto"));
 
+  // The browser's name from its user agent, for the paired browsers list.
+  function browserName(agent) {
+    var names = [["Edg", "Edge"], ["OPR", "Opera"], ["Firefox", "Firefox"], ["Chrome", "Chrome"], ["Safari", "Safari"]];
+    for (var i = 0; i < names.length; i++) {
+      if ((agent || "").indexOf(names[i][0] + "/") >= 0) {
+        return names[i][1];
+      }
+    }
+    return "Browser";
+  }
+
   // ---- HTTP -------------------------------------------------------------
 
   // Sends a request and resolves with the parsed JSON body (or null). Errors
@@ -198,6 +209,17 @@
       dropping: false,
       fileName: "",
 
+      // Remote access. `access` says who this page is: "local" on the
+      // machine itself, "paired" for a browser that entered the code, or
+      // "none" when it has to ask for one.
+      access: "checking",
+      pairing: null, // the code and the paired browsers, shown on the machine
+      pairingBusy: false, // a load of `pairing` is in flight
+      pairBusy: false, // this browser is sending a code
+      pairCode: "",
+      pairError: "",
+      stream: null, // the open event stream, while there is access to it
+
       // Forms.
       axes: AXIS_NAMES.map(function (name, i) {
         return { name: name, key: AXIS_KEYS[i], index: i };
@@ -243,6 +265,7 @@
         }
         setInterval(function () {
           self.now = Date.now();
+          self.refreshPairing();
         }, 1000);
 
         // The tab says what the machine is doing, so a job can be watched from
@@ -251,6 +274,17 @@
           document.title = self.pageTitle;
         });
 
+        this.checkAccess(function (access) {
+          if (access !== "none") {
+            self.loadAll();
+          }
+        });
+        this.drawPreview();
+      },
+
+      // Loads what the page shows, once it may use the API.
+      loadAll: function () {
+        var self = this;
         request("GET", "/settings").then(function (s) {
           self.fillSettings(s);
         }).catch(function (e) {
@@ -266,8 +300,10 @@
         }).catch(function (e) {
           self.notify(e);
         });
-        this.connectEvents();
-        this.drawPreview();
+        this.loadPairing();
+        if (!this.stream) {
+          this.connectEvents();
+        }
       },
 
       // ---- Feedback -----------------------------------------------------
@@ -1328,11 +1364,132 @@
         });
       },
 
+      // ---- Remote access ------------------------------------------------
+
+      // Asks the sender who this page is. `then` gets the answer, or null
+      // when the sender could not be asked.
+      checkAccess: function (then) {
+        var self = this;
+        return request("GET", "/session").then(function (s) {
+          self.access = s.access;
+          if (then) {
+            then(s.access);
+          }
+        }, function (e) {
+          self.notify(e);
+          if (then) {
+            then(null);
+          }
+        });
+      },
+
+      // Pairs this browser with the code on the sender's screen.
+      pair: function () {
+        var self = this;
+        var digits = this.pairCode.replace(/\D/g, "");
+        if (digits.length !== 6) {
+          this.pairError = "Enter the six digits shown on the sender.";
+          return;
+        }
+        this.pairError = "";
+        this.pairBusy = true;
+        return request("POST", "/pairing", { code: digits }).then(function () {
+          self.pairCode = "";
+          self.access = "paired";
+          self.loadAll();
+        }, function (e) {
+          self.pairError = e.message;
+        }).then(function () {
+          self.pairBusy = false;
+        });
+      },
+
+      // On the machine: the code on screen and the browsers paired so far.
+      loadPairing: function () {
+        var self = this;
+        if (this.access !== "local" || this.pairingBusy) {
+          return Promise.resolve();
+        }
+        this.pairingBusy = true;
+        return request("GET", "/pairing").then(function (view) {
+          self.pairing = view;
+        }).catch(function (e) {
+          self.notify(e);
+        }).then(function () {
+          self.pairingBusy = false;
+        });
+      },
+
+      // Reloads the pairing view when its code has run out, and every few
+      // seconds while the remote access tab is open, so new pairings show.
+      refreshPairing: function () {
+        if (this.access !== "local" || this.pairingBusy) {
+          return;
+        }
+        var stale = !this.pairing || this.pairing.expires_at_ms <= this.now;
+        var watching = this.setupTab === "remote" && Math.floor(this.now / 1000) % 5 === 0;
+        if (stale || watching) {
+          this.loadPairing();
+        }
+      },
+
+      showPairing: function () {
+        this.setupTab = "remote";
+        this.loadPairing();
+      },
+
+      newPairingCode: function () {
+        var self = this;
+        return this.act("pairingNew", function () {
+          return request("POST", "/pairing/code").then(function (view) {
+            self.pairing = view;
+          });
+        });
+      },
+
+      revokeDevice: function (id) {
+        var self = this;
+        return this.act("revoke", function () {
+          return request("DELETE", "/pairing/devices/" + encodeURIComponent(id)).then(function () {
+            return self.loadPairing();
+          });
+        });
+      },
+
+      get pairingCode() {
+        var code = this.pairing ? this.pairing.code : "";
+        return code || "...";
+      },
+
+      get pairingNote() {
+        if (!this.pairing) {
+          return "";
+        }
+        var left = this.pairing.expires_at_ms - this.now;
+        return left > 0 ? "Expires in " + Lib.formatDuration(left) : "Expired; a new code is on its way";
+      },
+
+      get hasPairedDevices() {
+        return !!this.pairing && this.pairing.devices.length > 0;
+      },
+
+      get pairedDevices() {
+        return (this.pairing ? this.pairing.devices : []).map(function (d) {
+          return {
+            id: d.id,
+            name: browserName(d.user_agent),
+            agent: d.user_agent,
+            when: new Date(d.paired_at_ms).toLocaleString(),
+          };
+        });
+      },
+
       // ---- Event stream -------------------------------------------------
 
       connectEvents: function () {
         var self = this;
         var events = new EventSource("/events");
+        this.stream = events;
         events.onopen = function () {
           self.live = "live";
           // The stream starts with the current state. Refresh the program
@@ -1341,6 +1498,13 @@
         };
         events.onerror = function () {
           self.live = "reconnecting";
+          // A revoked browser gets refused here. Stop retrying and ask for a code.
+          self.checkAccess(function (access) {
+            if (access === "none" && self.stream) {
+              self.stream.close();
+              self.stream = null;
+            }
+          });
         };
         events.addEventListener("machine", function (e) {
           self.handleMachine(JSON.parse(e.data));
