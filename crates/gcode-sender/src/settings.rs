@@ -8,6 +8,56 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub pause: PauseSettings,
     pub position: PositionSettings,
+    pub jog: JogSettings,
+}
+
+/// The largest feed a jog may be saved with, in millimetres per minute.
+pub const MAX_JOG_FEED: f64 = 10_000.0;
+
+/// How fast jogs by hand go, in millimetres per minute. X and Y share one
+/// speed, and Z has its own, usually slower, as on most CNC software.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct JogSettings {
+    /// Feed for jogs along X or Y.
+    pub xy_feed: f64,
+    /// Feed for jogs along Z.
+    pub z_feed: f64,
+}
+
+impl Default for JogSettings {
+    fn default() -> Self {
+        Self {
+            xy_feed: 1000.0,
+            z_feed: 300.0,
+        }
+    }
+}
+
+impl JogSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, feed) in [("jog.xy_feed", self.xy_feed), ("jog.z_feed", self.z_feed)] {
+            if !(feed.is_finite() && feed > 0.0 && feed <= MAX_JOG_FEED) {
+                return Err(format!(
+                    "{name} must be above zero and at most {MAX_JOG_FEED} millimetres per minute"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The feed for a jog along the axes given as `[x, y, z]`, where `true`
+    /// means the jog moves that axis. A move that uses both speeds runs at
+    /// the slower one, so no axis goes faster than its setting.
+    pub fn feed_for(&self, axes: [bool; 3]) -> f64 {
+        let xy = axes[0] || axes[1];
+        let z = axes[2];
+        match (xy, z) {
+            (true, true) => self.xy_feed.min(self.z_feed),
+            (true, false) => self.xy_feed,
+            _ => self.z_feed,
+        }
+    }
 }
 
 /// What to do when the controller reports a different position than the
@@ -72,7 +122,8 @@ impl PauseSettings {
 
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
-        self.pause.validate()
+        self.pause.validate()?;
+        self.jog.validate()
     }
 }
 
@@ -100,5 +151,27 @@ impl PauseOptions {
         }
         settings.validate()?;
         Ok(settings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mixed_move_runs_at_the_slower_speed() {
+        let jog = JogSettings {
+            xy_feed: 800.0,
+            z_feed: 150.0,
+        };
+        assert_eq!(jog.feed_for([true, false, false]), 800.0);
+        assert_eq!(jog.feed_for([false, true, false]), 800.0);
+        assert_eq!(jog.feed_for([false, false, true]), 150.0);
+        assert_eq!(jog.feed_for([true, false, true]), 150.0);
+        let fast_z = JogSettings {
+            xy_feed: 800.0,
+            z_feed: 2000.0,
+        };
+        assert_eq!(fast_z.feed_for([true, true, true]), 800.0);
     }
 }

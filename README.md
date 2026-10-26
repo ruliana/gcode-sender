@@ -258,7 +258,7 @@ The behaviour is a setting, on by default:
 
 ```sh
 curl localhost:8080/settings
-# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0},"position":{"trust_record":true}}
+# {"pause":{"lift":true,"height":10.0,"z":null,"dwell_s":3.0},"position":{"trust_record":true},"jog":{"xy_feed":1000.0,"z_feed":300.0}}
 
 # A pause is a plain feed hold; resume is a cycle start.
 curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
@@ -267,11 +267,18 @@ curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
 # Or per pause:
 curl -X POST localhost:8080/jobs/$id/pause -H 'content-type: application/json' \
   -d '{"height": 25}'
+
+# Hand jog speeds, in millimetres per minute. This body leaves pause and
+# position at their defaults, so change them in the same PUT if they differ.
+curl -X PUT localhost:8080/settings -H 'content-type: application/json' \
+  -d '{"jog": {"xy_feed": 1500, "z_feed": 200}}'
 ```
 
-`PUT /settings` replaces the whole document, so leave out what should stay at
-its default. They are kept in `settings.json` in the data directory.
-`dwell_s` has to stay below `--ack-timeout-ms`.
+`PUT /settings` replaces the whole document. A body that holds only `jog`
+resets `pause` and `position` to their defaults, so send everything that
+should stay as it is, as `GET /settings` returned it. They are kept in
+`settings.json` in the data directory. `dwell_s` has to stay below
+`--ack-timeout-ms`.
 
 ### Interrupted jobs and resuming
 
@@ -420,7 +427,8 @@ comments. Ctrl-C ends open streams so the server can exit.
 
 `POST /machine/jog` sends a Grbl `$J=` jog, which the controller runs
 as a short move that can be cancelled at any moment. Distances and feed are
-in millimetres and millimetres per minute.
+in millimetres and millimetres per minute. The feed is optional: left out,
+it comes from the saved jog speeds, see [Jog speeds](#jog-speeds) below.
 
 ```sh
 # Move 10 mm along X and 2.5 mm back along Y from where the tool is.
@@ -433,6 +441,14 @@ curl -X POST localhost:8080/machine/jog -H 'content-type: application/json' \
   -d '{"x": 0, "y": 0, "feed": 3000, "mode": "absolute"}'
 
 curl -X POST localhost:8080/machine/jog/cancel
+```
+
+```sh
+# Jog along Y at the saved XY speed, and along Z at the saved Z speed.
+curl -X POST localhost:8080/machine/jog -H 'content-type: application/json' \
+  -d '{"y": 10}'
+curl -X POST localhost:8080/machine/jog -H 'content-type: application/json' \
+  -d '{"z": -1}'
 ```
 
 `mode` is `relative` (the default) or `absolute`; `space` (`work`, the
@@ -449,6 +465,17 @@ state that is not idle, and (`503`) while disconnected. When boundaries are
 set, the destination is checked first, counting the jogs still queued, and a
 jog that leaves them is refused with `422`. As with jobs, this is on top of
 the controller's soft limits, not instead of them.
+
+#### Jog speeds
+
+Hand jogs have two saved speeds, as on most CNC software: `jog.xy_feed`
+for X and Y, which defaults to 1000 mm/min, and `jog.z_feed` for Z, which
+defaults to 300 mm/min. A jog without a `feed` uses the speed for the axes
+it moves. A move that uses both kinds of axis, such as X and Z, runs at the
+slower of the two, so no axis goes faster than its own speed. A `feed` in
+the request still wins. Both speeds must be above zero and at most 10000
+mm/min. They are set with `PUT /settings`, and the web UI's Jog panel
+shows and changes them.
 
 ### Work zero and work offsets
 

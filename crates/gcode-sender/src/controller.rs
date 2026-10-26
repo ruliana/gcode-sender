@@ -207,7 +207,10 @@ pub struct JogRequest {
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub z: Option<f64>,
-    pub feed: f64,
+    /// Left out, the feed comes from the saved jog speeds: `jog.xy_feed` for
+    /// X and Y, `jog.z_feed` for Z, and the slower of the two for a move that
+    /// uses both.
+    pub feed: Option<f64>,
     #[serde(default)]
     pub mode: JogMode,
     /// Only for absolute jogs. Defaults to the work coordinate system.
@@ -1705,9 +1708,6 @@ impl Actor {
                 ));
             }
         }
-        if !(request.feed.is_finite() && request.feed > 0.0) {
-            return invalid("feed must be a positive number");
-        }
         let axes = [request.x, request.y, request.z];
         if axes.iter().all(Option::is_none) {
             return invalid("a jog needs at least one of x, y or z");
@@ -1715,6 +1715,15 @@ impl Actor {
         if axes.iter().flatten().any(|v| !v.is_finite()) {
             return invalid("x, y and z must be numbers");
         }
+        let feed = match request.feed {
+            Some(feed) if feed.is_finite() && feed > 0.0 => feed,
+            Some(_) => return invalid("feed must be a positive number"),
+            None => self
+                .store
+                .settings()?
+                .jog
+                .feed_for(axes.map(|a| a.is_some())),
+        };
         if request.mode == JogMode::Relative && request.space.is_some() {
             return invalid("space only applies to absolute jogs");
         }
@@ -1750,7 +1759,7 @@ impl Actor {
                 (JogMode::Absolute, JogSpace::Work) => offset.map(|o| o[i] + v),
             };
         }
-        line.push_str(&format!(" F{:.3}", request.feed));
+        line.push_str(&format!(" F{feed:.3}"));
 
         if let Some(limits) = self.store.bounds()? {
             if axes

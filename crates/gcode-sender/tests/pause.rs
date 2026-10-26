@@ -441,7 +441,8 @@ async fn settings_have_defaults_and_are_kept() {
         body,
         json!({
             "pause": {"lift": true, "height": 10.0, "z": null, "dwell_s": 3.0},
-            "position": {"trust_record": true}
+            "position": {"trust_record": true},
+            "jog": {"xy_feed": 1000.0, "z_feed": 300.0}
         })
     );
 
@@ -452,7 +453,8 @@ async fn settings_have_defaults_and_are_kept() {
     .await;
     let expected = json!({
         "pause": {"lift": false, "height": 4.0, "z": -2.5, "dwell_s": 3.0},
-        "position": {"trust_record": true}
+        "position": {"trust_record": true},
+        "jog": {"xy_feed": 1000.0, "z_feed": 300.0}
     });
     assert_eq!(h.get("/settings").await.1, expected);
 
@@ -464,7 +466,6 @@ async fn settings_have_defaults_and_are_kept() {
         json!({"pause": {"dwell_s": 120}}),
         json!({"pause": {"lift": "yes"}}),
         json!({"pause": {"speed": 1}}),
-        json!({"jog": {}}),
     ] {
         let (status, _) = h.put_json("/settings", &bad).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");

@@ -204,7 +204,7 @@
       }),
       steps: STEPS,
       jogStep: "1",
-      jogFeed: "1000",
+      jogForm: { xy: "", z: "" }, // the saved jog speeds, as typed
       zeroSystem: "",
       zeroForm: { x: "", y: "", z: "" },
       offsetForm: { x: "", y: "", z: "" },
@@ -217,10 +217,6 @@
         var step = remembered("jog-step", null);
         if (STEPS.indexOf(step) >= 0) {
           this.jogStep = step;
-        }
-        var feed = Number(remembered("jog-feed", ""));
-        if (feed > 0) {
-          this.jogFeed = String(feed);
         }
 
         preview = window.SenderPreview.create(this.$refs.viewport, function (zoomed) {
@@ -623,7 +619,21 @@
 
       rememberJog: function () {
         remember("jog-step", this.jogStep);
-        remember("jog-feed", this.jogFeed);
+      },
+
+      // The jog speeds are saved on the server, so every screen jogs alike.
+      // The server picks the speed for each jog from them.
+      saveJogFeeds: function () {
+        var self = this;
+        return this.act("jog-feed", function () {
+          var xy = requiredNumber(self.jogForm.xy, "XY feed");
+          var z = requiredNumber(self.jogForm.z, "Z feed");
+          var next = JSON.parse(JSON.stringify(self.settings || {}));
+          next.jog = { xy_feed: xy, z_feed: z };
+          return request("PUT", "/settings", next).then(function (s) {
+            self.fillSettings(s);
+          });
+        });
       },
 
       // Sends one jog of the chosen step (times `multiplier`) along an axis.
@@ -631,11 +641,7 @@
         var self = this;
         return this.act("jog", function () {
           var step = Number(self.jogStep) * multiplier;
-          var feed = Number(self.jogFeed);
-          if (!(feed > 0)) {
-            throw new Error("Feed must be above zero");
-          }
-          var body = { feed: feed };
+          var body = {};
           body[axis.toLowerCase()] = sign * step;
           return request("POST", "/machine/jog", body);
         });
@@ -1251,6 +1257,10 @@
       fillSettings: function (settings) {
         this.settings = settings;
         var pause = settings.pause;
+        if (settings.jog) {
+          this.jogForm.xy = blankIfMissing(settings.jog.xy_feed);
+          this.jogForm.z = blankIfMissing(settings.jog.z_feed);
+        }
         this.settingsForm.lift = !!pause.lift;
         this.settingsForm.height = blankIfMissing(pause.height);
         this.settingsForm.z = blankIfMissing(pause.z);

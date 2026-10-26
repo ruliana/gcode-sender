@@ -151,7 +151,6 @@ async fn malformed_jogs_are_refused_before_reaching_the_controller() {
     let h = Harness::start(SimConfig::grbl()).await;
     let invalid = StatusCode::UNPROCESSABLE_ENTITY;
     assert_refused(&h, json!({"feed": 100}), invalid, &["at least one"]).await;
-    assert_refused(&h, json!({"x": 1}), invalid, &["feed"]).await;
     assert_refused(&h, json!({"x": 1, "feed": 0}), invalid, &["feed"]).await;
     assert_refused(&h, json!({"x": 1, "feed": -5}), invalid, &["feed"]).await;
     assert_refused(&h, json!({"x": 1, "feed": 100, "w": 3}), invalid, &["w"]).await;
@@ -349,4 +348,82 @@ async fn a_jog_in_flight_when_the_link_drops_is_not_reported_as_done() {
         .await
         .expect("the request must not hang");
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+async fn put_settings(h: &Harness, body: Value) {
+    let (status, reply) = h.put_json("/settings", &body).await;
+    assert_eq!(status, StatusCode::OK, "{body}: {reply}");
+}
+
+#[tokio::test]
+async fn a_jog_without_a_feed_uses_the_saved_speed_for_its_axes() {
+    let h = Harness::start(SimConfig::grbl()).await;
+
+    assert_jogs(&h, json!({"x": 1})).await;
+    h.wait_idle().await;
+    assert_jogs(&h, json!({"z": 1})).await;
+    h.wait_idle().await;
+    assert_jogs(&h, json!({"x": 1, "y": 1})).await;
+    h.wait_idle().await;
+    assert_jogs(&h, json!({"x": 1, "z": 1})).await;
+    h.wait_idle().await;
+    assert_eq!(
+        jog_lines(&h.sim),
+        [
+            "$J=G21 G91 X1.000 F1000.000",
+            "$J=G21 G91 Z1.000 F300.000",
+            "$J=G21 G91 X1.000 Y1.000 F1000.000",
+            "$J=G21 G91 X1.000 Z1.000 F300.000",
+        ]
+    );
+
+    // XY and Z have their own speeds, saved with the other settings.
+    put_settings(&h, json!({"jog": {"xy_feed": 800, "z_feed": 150}})).await;
+    assert_eq!(
+        h.get("/settings").await.1["jog"],
+        json!({"xy_feed": 800.0, "z_feed": 150.0})
+    );
+    assert_jogs(&h, json!({"y": 1})).await;
+    h.wait_idle().await;
+    assert_jogs(&h, json!({"z": -1})).await;
+    h.wait_idle().await;
+    assert_jogs(&h, json!({"x": 1, "y": 1, "z": 1})).await;
+    h.wait_idle().await;
+    let lines = jog_lines(&h.sim);
+    assert_eq!(lines[4], "$J=G21 G91 Y1.000 F800.000");
+    assert_eq!(lines[5], "$J=G21 G91 Z-1.000 F150.000");
+    assert_eq!(lines[6], "$J=G21 G91 X1.000 Y1.000 Z1.000 F150.000");
+}
+
+#[tokio::test]
+async fn an_explicit_feed_still_wins_over_the_saved_speeds() {
+    let h = Harness::start(SimConfig::grbl()).await;
+    put_settings(&h, json!({"jog": {"xy_feed": 800, "z_feed": 150}})).await;
+    assert_jogs(&h, json!({"x": 2, "feed": 2500})).await;
+    h.wait_idle().await;
+    assert_eq!(jog_lines(&h.sim), ["$J=G21 G91 X2.000 F2500.000"]);
+}
+
+#[tokio::test]
+async fn jog_speeds_are_validated_and_kept_across_restarts() {
+    let mut h = Harness::start(SimConfig::grbl()).await;
+    let expected = json!({"xy_feed": 1000.0, "z_feed": 300.0});
+    assert_eq!(h.get("/settings").await.1["jog"], expected);
+
+    put_settings(&h, json!({"jog": {"z_feed": 120}})).await;
+    let expected = json!({"xy_feed": 1000.0, "z_feed": 120.0});
+    h.restart_server().await;
+    assert_eq!(h.get("/settings").await.1["jog"], expected);
+
+    let invalid = StatusCode::UNPROCESSABLE_ENTITY;
+    for bad in [
+        json!({"jog": {"xy_feed": 0}}),
+        json!({"jog": {"z_feed": -10}}),
+        json!({"jog": {"z_feed": 20000}}),
+        json!({"jog": {"speed": 1}}),
+    ] {
+        let (status, _) = h.put_json("/settings", &bad).await;
+        assert_eq!(status, invalid, "{bad}");
+    }
+    assert_eq!(h.get("/settings").await.1["jog"], expected);
 }
