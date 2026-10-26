@@ -8,6 +8,7 @@ mod position;
 mod program;
 mod settings;
 mod store;
+mod tls;
 mod web;
 mod work;
 
@@ -32,12 +33,20 @@ struct Args {
     #[arg(long, env = "GCODE_SENDER_BAUD", default_value_t = 115_200)]
     baud: u32,
 
-    /// Address for the HTTP API and web UI, as an IP address and port. Use
-    /// 127.0.0.1 to serve only this machine. Other computers reach the sender
-    /// by pairing a browser with the code shown on its screen. Use port 0 to
+    /// Address for this machine's own pages and API, over plain HTTP. It must
+    /// be a loopback address, so only this machine can reach it. Use port 0 to
     /// pick a free port.
-    #[arg(long, env = "GCODE_SENDER_LISTEN", default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "GCODE_SENDER_LISTEN", default_value = "127.0.0.1:8080")]
     listen: String,
+
+    /// Address for remote browsers, over HTTPS with a self-signed certificate.
+    /// They pair with the code shown on this machine before they can use it.
+    #[arg(long, env = "GCODE_SENDER_REMOTE", default_value = "0.0.0.0:8443")]
+    remote: String,
+
+    /// Do not accept remote browsers. Only --listen is served.
+    #[arg(long, env = "GCODE_SENDER_NO_REMOTE")]
+    no_remote: bool,
 
     /// Where jobs are stored. Everything needed after a restart lives here.
     #[arg(long, env = "GCODE_SENDER_DATA_DIR", default_value = "./data")]
@@ -78,22 +87,46 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
+    // Checked before the serial port or the data directory is touched.
     let listen: SocketAddr = args.listen.parse().with_context(|| {
         format!(
-            "--listen {} must be an IP address and port, such as 0.0.0.0:8080",
+            "--listen {} must be an IP address and port, such as 127.0.0.1:8080",
             args.listen
         )
     })?;
+    anyhow::ensure!(
+        listen.ip().is_loopback(),
+        "--listen serves plain HTTP to this machine only, so it must be a loopback address \
+         (127.0.0.1 or [::1]), not {listen}; remote browsers use --remote"
+    );
+    let remote: Option<SocketAddr> = if args.no_remote {
+        None
+    } else {
+        Some(args.remote.parse().with_context(|| {
+            format!(
+                "--remote {} must be an IP address and port, such as 0.0.0.0:8443",
+                args.remote
+            )
+        })?)
+    };
 
     let store = Arc::new(store::JobStore::open(&args.data_dir)?);
     for job in store.recover()? {
         warn!(id = %job.id, "job was active when the server last stopped; marked interrupted");
     }
     let pairing = Arc::new(pairing::Pairing::open(&args.data_dir)?);
-    if !listen.ip().is_loopback() {
-        let code = pairing.view().code;
-        info!("other computers can pair with the code {code} (shown on this machine's page)");
-    }
+
+    let tls = match remote {
+        Some(_) => {
+            // Chosen here rather than left to the features of the dependencies.
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .ok();
+            let (cert, key) = tls::load_or_create(&args.data_dir)?;
+            Some(axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await?)
+        }
+        None => None,
+    };
 
     let controller = controller::spawn(
         controller::Config {
@@ -109,31 +142,72 @@ async fn main() -> anyhow::Result<()> {
         store.clone(),
     );
 
-    let listener = tokio::net::TcpListener::bind(listen)
+    let local_listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    let addr = listener.local_addr()?;
-    info!(%addr, "HTTP API listening");
-    // Printed on stdout so scripts and tests can find the port.
-    println!("listening on {addr}");
-    info!("web UI at http://{addr}/");
+    let local_addr = local_listener.local_addr()?;
+    info!(%local_addr, "HTTP API listening");
+    // Printed on stdout so scripts and tests can find the ports.
+    println!("listening on {local_addr}");
+    info!("web UI at http://{local_addr}/");
+
+    let remote_listener = match remote {
+        Some(addr) => {
+            let listener =
+                std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+            listener.set_nonblocking(true)?;
+            let bound = listener.local_addr()?;
+            info!(%bound, "HTTPS listening for remote browsers");
+            println!("remote listening on https://{bound}");
+            Some((listener, bound))
+        }
+        None => None,
+    };
+    if let Some((_, bound)) = &remote_listener {
+        let code = pairing.view().code;
+        info!("remote browsers pair at https://{bound}/ with the code {code}");
+    }
 
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let app = http::router(http::AppState {
-        store,
-        controller,
-        pairing,
-        shutdown,
-    });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         // Event streams never end on their own.
         let _ = stop.send(true);
-    })
-    .await?;
+    });
+
+    let state = |local: bool| http::AppState {
+        store: store.clone(),
+        controller: controller.clone(),
+        pairing: pairing.clone(),
+        shutdown: shutdown.clone(),
+        local,
+    };
+    let mut ended = shutdown.clone();
+    let local_server = axum::serve(local_listener, http::router(state(true)))
+        .with_graceful_shutdown(async move {
+            let _ = ended.wait_for(|stopping| *stopping).await;
+        });
+
+    let remote_server = async {
+        let Some((listener, _)) = remote_listener else {
+            return Ok(());
+        };
+        let tls = tls.expect("the certificate is loaded when remote access is on");
+        let handle = axum_server::Handle::new();
+        let stopping = handle.clone();
+        let mut ended = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = ended.wait_for(|stopping| *stopping).await;
+            stopping.graceful_shutdown(Some(Duration::from_secs(2)));
+        });
+        axum_server::from_tcp_rustls(listener, tls)
+            .handle(handle)
+            .serve(http::router(state(false)).into_make_service())
+            .await
+    };
+
+    let (local_result, remote_result) = tokio::join!(local_server, remote_server);
+    local_result?;
+    remote_result?;
     Ok(())
 }

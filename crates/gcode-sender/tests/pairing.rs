@@ -1,9 +1,9 @@
 //! Pairing: a browser on another computer gets in with the code shown on the
 //! sender's screen, and keeps access until the machine revokes it.
 //!
-//! The test runs on this machine, so the connection is loopback. A request
-//! that names the sender by a host name other than loopback is what a remote
-//! browser looks like to the sender.
+//! Remote browsers use the sender's HTTPS listener. The test runs on this
+//! machine, so its connections are loopback, but the HTTPS listener never
+//! trusts a connection as this machine's own page.
 
 mod common;
 
@@ -12,11 +12,18 @@ use grbl_sim::SimConfig;
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 
-const REMOTE_HOST: &str = "sender.example:8080";
+/// A client for the HTTPS listener. Its certificate is self-signed, as it is
+/// for a real browser, so it is accepted here.
+fn remote_client() -> Client {
+    Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+}
 
 /// A request as a browser on another computer sends it.
 fn remote(client: &Client, method: Method, url: String) -> RequestBuilder {
-    client.request(method, url).header("host", REMOTE_HOST)
+    client.request(method, url)
 }
 
 /// The code showing on the machine, read from its own screen.
@@ -29,7 +36,7 @@ async fn code_on_screen(h: &Harness) -> String {
 /// Pairs a browser with the code on screen and returns its token.
 async fn pair(h: &Harness, client: &Client) -> String {
     let code = code_on_screen(h).await;
-    let res = remote(client, Method::POST, format!("{}/pairing", h.base))
+    let res = remote(client, Method::POST, format!("{}/pairing", h.remote))
         .json(&json!({ "code": code }))
         .send()
         .await
@@ -46,9 +53,9 @@ fn with_token(req: RequestBuilder, token: &str) -> RequestBuilder {
 #[tokio::test]
 async fn a_remote_browser_is_asked_to_pair_and_can_still_load_the_page() {
     let h = Harness::start_unready(SimConfig::grbl()).await;
-    let client = Client::new();
+    let client = remote_client();
 
-    let res = remote(&client, Method::GET, format!("{}/machine", h.base))
+    let res = remote(&client, Method::GET, format!("{}/machine", h.remote))
         .send()
         .await
         .unwrap();
@@ -56,13 +63,13 @@ async fn a_remote_browser_is_asked_to_pair_and_can_still_load_the_page() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["pairing"], true);
 
-    let res = remote(&client, Method::GET, format!("{}/", h.base))
+    let res = remote(&client, Method::GET, format!("{}/", h.remote))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let res = remote(&client, Method::GET, format!("{}/session", h.base))
+    let res = remote(&client, Method::GET, format!("{}/session", h.remote))
         .send()
         .await
         .unwrap();
@@ -73,7 +80,7 @@ async fn a_remote_browser_is_asked_to_pair_and_can_still_load_the_page() {
 #[tokio::test]
 async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
     let h = Harness::start_unready(SimConfig::grbl()).await;
-    let client = Client::new();
+    let client = remote_client();
     let code = code_on_screen(&h).await;
     assert_eq!(code.len(), 7, "shown as two groups of three: {code}");
 
@@ -83,7 +90,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
     } else {
         "000 000"
     };
-    let res = remote(&client, Method::POST, format!("{}/pairing", h.base))
+    let res = remote(&client, Method::POST, format!("{}/pairing", h.remote))
         .json(&json!({ "code": wrong }))
         .send()
         .await
@@ -93,7 +100,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
     assert!(body["error"].as_str().unwrap().contains("4 more tries"));
 
     // The right code gives a cookie and a token.
-    let res = remote(&client, Method::POST, format!("{}/pairing", h.base))
+    let res = remote(&client, Method::POST, format!("{}/pairing", h.remote))
         .json(&json!({ "code": code }))
         .send()
         .await
@@ -108,19 +115,20 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
         .to_string();
     assert!(cookie.contains("HttpOnly"), "{cookie}");
     assert!(cookie.contains("SameSite=Strict"), "{cookie}");
+    assert!(cookie.contains("Secure"), "{cookie}");
     let body: Value = res.json().await.unwrap();
     let token = body["token"].as_str().unwrap().to_string();
 
     // The cookie opens the API, and so does a bearer token.
     let res = with_token(
-        remote(&client, Method::GET, format!("{}/machine", h.base)),
+        remote(&client, Method::GET, format!("{}/machine", h.remote)),
         &token,
     )
     .send()
     .await
     .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let res = remote(&client, Method::GET, format!("{}/machine", h.base))
+    let res = remote(&client, Method::GET, format!("{}/machine", h.remote))
         .header("authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -128,7 +136,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
     assert_eq!(res.status(), StatusCode::OK);
 
     // A code works once.
-    let res = remote(&client, Method::POST, format!("{}/pairing", h.base))
+    let res = remote(&client, Method::POST, format!("{}/pairing", h.remote))
         .json(&json!({ "code": code }))
         .send()
         .await
@@ -137,7 +145,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
 
     // Only the machine's own screen manages pairings.
     let res = with_token(
-        remote(&client, Method::GET, format!("{}/pairing", h.base)),
+        remote(&client, Method::GET, format!("{}/pairing", h.remote)),
         &token,
     )
     .send()
@@ -145,7 +153,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
     .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     let res = with_token(
-        remote(&client, Method::GET, format!("{}/session", h.base)),
+        remote(&client, Method::GET, format!("{}/session", h.remote)),
         &token,
     )
     .send()
@@ -162,7 +170,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
     let (status, _) = h.delete(&format!("/pairing/devices/{id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let res = with_token(
-        remote(&client, Method::GET, format!("{}/machine", h.base)),
+        remote(&client, Method::GET, format!("{}/machine", h.remote)),
         &token,
     )
     .send()
@@ -176,7 +184,7 @@ async fn the_code_pairs_a_browser_once_and_the_token_then_opens_the_api() {
 #[tokio::test]
 async fn five_wrong_guesses_use_the_code_up() {
     let h = Harness::start_unready(SimConfig::grbl()).await;
-    let client = Client::new();
+    let client = remote_client();
     let code = code_on_screen(&h).await;
     let wrong = if code == "000 000" {
         "111 111"
@@ -186,7 +194,7 @@ async fn five_wrong_guesses_use_the_code_up() {
 
     let mut last = None;
     for _ in 0..5 {
-        let res = remote(&client, Method::POST, format!("{}/pairing", h.base))
+        let res = remote(&client, Method::POST, format!("{}/pairing", h.remote))
             .json(&json!({ "code": wrong }))
             .send()
             .await
@@ -198,7 +206,7 @@ async fn five_wrong_guesses_use_the_code_up() {
     assert!(message.contains("no tries are left"), "{message}");
 
     // Even the right code is dead now; the machine has to show a new one.
-    let res = remote(&client, Method::POST, format!("{}/pairing", h.base))
+    let res = remote(&client, Method::POST, format!("{}/pairing", h.remote))
         .json(&json!({ "code": code }))
         .send()
         .await
@@ -209,13 +217,13 @@ async fn five_wrong_guesses_use_the_code_up() {
 #[tokio::test]
 async fn a_cross_site_page_is_refused_even_with_a_paired_token() {
     let h = Harness::start_unready(SimConfig::grbl()).await;
-    let client = Client::new();
+    let client = remote_client();
     let token = pair(&h, &client).await;
     let jog = json!({ "x": 10, "feed": 1000 });
 
     // Another site's page, made in the visitor's browser.
     let res = with_token(
-        remote(&client, Method::POST, format!("{}/machine/jog", h.base)),
+        remote(&client, Method::POST, format!("{}/machine/jog", h.remote)),
         &token,
     )
     .header("origin", "http://evil.example")
@@ -228,7 +236,7 @@ async fn a_cross_site_page_is_refused_even_with_a_paired_token() {
 
     // Even with no Origin header, a request the browser calls cross-site is refused.
     let res = with_token(
-        remote(&client, Method::POST, format!("{}/machine/jog", h.base)),
+        remote(&client, Method::POST, format!("{}/machine/jog", h.remote)),
         &token,
     )
     .header("sec-fetch-site", "cross-site")
@@ -240,10 +248,10 @@ async fn a_cross_site_page_is_refused_even_with_a_paired_token() {
 
     // The sender's own page, as the paired browser loads it.
     let res = with_token(
-        remote(&client, Method::GET, format!("{}/machine", h.base)),
+        remote(&client, Method::GET, format!("{}/machine", h.remote)),
         &token,
     )
-    .header("origin", format!("http://{REMOTE_HOST}"))
+    .header("origin", h.remote.clone())
     .header("sec-fetch-site", "same-origin")
     .send()
     .await
@@ -254,13 +262,13 @@ async fn a_cross_site_page_is_refused_even_with_a_paired_token() {
 #[tokio::test]
 async fn a_paired_browser_stays_paired_across_a_restart() {
     let mut h = Harness::start_unready(SimConfig::grbl()).await;
-    let client = Client::new();
+    let client = remote_client();
     let token = pair(&h, &client).await;
 
     h.restart_server().await;
 
     let res = with_token(
-        remote(&client, Method::GET, format!("{}/machine", h.base)),
+        remote(&client, Method::GET, format!("{}/machine", h.remote)),
         &token,
     )
     .send()
@@ -272,4 +280,22 @@ async fn a_paired_browser_stays_paired_across_a_restart() {
         !stored.contains(&token),
         "the token itself must not be stored"
     );
+}
+
+#[tokio::test]
+async fn a_connection_on_the_https_listener_is_never_this_machine() {
+    let h = Harness::start_unready(SimConfig::grbl()).await;
+    let client = remote_client();
+
+    // The connection is loopback and the name is loopback, but it came in
+    // over the HTTPS listener, so it needs a paired browser like any other.
+    let res = remote(&client, Method::GET, format!("{}/machine", h.remote))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // The plain-HTTP listener on this machine is still trusted.
+    let (status, _) = h.get("/machine").await;
+    assert_eq!(status, StatusCode::OK);
 }

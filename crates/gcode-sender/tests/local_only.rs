@@ -12,6 +12,24 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 #[test]
+fn the_plain_http_listener_must_stay_on_loopback() {
+    let dir = tempfile::tempdir().unwrap();
+    for listen in ["0.0.0.0:0", "192.168.1.10:8080", "[::]:8080"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_gcode-sender"))
+            .args(["--port", "/dev/null", "--listen", listen, "--data-dir"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{listen} should be refused");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("loopback"),
+            "{listen}: unexpected message: {err}"
+        );
+    }
+}
+
+#[test]
 fn the_listen_address_must_be_an_ip_address_and_port() {
     let dir = tempfile::tempdir().unwrap();
     for listen in ["localhost:8080", "8080", "127.0.0.1"] {
