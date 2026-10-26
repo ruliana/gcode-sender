@@ -3,221 +3,397 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
   <title>G-code Sender</title>
+  <link rel="preload" href="/vendor/fonts/DSEG7Classic-Bold.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/vendor/fonts/barlow-condensed-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/style.css">
   <script src="/lib.js" defer></script>
+  <script src="/vendor/d3-7.9.0.min.js" defer></script>
+  <script src="/preview.js" defer></script>
   <script src="/app.js" defer></script>
+  <script src="/vendor/alpine-csp-3.17.5.min.js" defer></script>
 </head>
-<body>
-  <header class="topbar">
-    <h1>G-code Sender</h1>
-    <span id="conn" class="pill bad">Starting</span>
-    <span id="port" class="muted"></span>
-    <span id="firmware" class="muted"></span>
-    <span id="live" class="muted">Connecting to events</span>
+<body x-data="sender" :data-view="view">
+
+  <!-- Shown until the page has started, and if it never does. -->
+  <p class="boot" x-show="false">Starting the control panel. If this stays, the page could not run its scripts.</p>
+
+  <header class="plate" x-cloak>
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M13 2h6l1 4 3 1.4 3.6-2.2 4.2 4.2-2.2 3.6L30 16l-1 3-4 1-1.4 3 2.2 3.6-4.2 4.2-3.6-2.2L16 30l-3-1-1-4-3-1.4-3.6 2.2-4.2-4.2 2.2-3.6L2 16l1-3 4-1 1.4-3-2.2-3.6 4.2-4.2 3.6 2.2z"/>
+        <circle cx="16" cy="16" r="5.5"/>
+      </svg>
+      <div>
+        <h1>G-code Sender</h1>
+        <p class="sub"><span x-text="firmwareText"></span><span x-show="machine &amp;&amp; machine.port" x-text="portText"></span></p>
+      </div>
+    </div>
+
+    <div class="tower" role="status" :aria-label="'Machine ' + stateText">
+      <span class="lamp red" :class="{ on: lamp === 'red' }"></span>
+      <span class="lamp amber" :class="{ on: lamp === 'amber' }"></span>
+      <span class="lamp green" :class="{ on: lamp === 'green', blink: lampBlinks }"></span>
+      <span class="state-word" :data-lamp="lamp" x-text="stateText"></span>
+    </div>
+
+    <div class="links">
+      <span class="led-label"><span class="led" :class="connTone"></span><span x-text="connText"></span></span>
+      <span class="led-label"><span class="led" :class="liveTone"></span><span x-text="liveText"></span></span>
+      <button type="button" class="theme" @click="cycleTheme()" :title="'Theme: ' + theme" :aria-label="'Theme: ' + theme + '. Change'">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 3a7 7 0 0 0 0 14z"/></svg>
+        <span x-text="theme"></span>
+      </button>
+    </div>
   </header>
 
-  <div id="alarm" class="banner error" role="alert" hidden></div>
-  <div id="notice" class="banner error" role="alert" hidden></div>
-
-  <section id="position-check" class="banner ask" role="alertdialog" aria-labelledby="pc-title" hidden>
-    <strong id="pc-title">Did the machine move?</strong>
-    <p id="pc-question"></p>
-    <p id="pc-detail" class="muted"></p>
-    <div class="row">
-      <button type="button" data-moved="false">No, it stayed where it was</button>
-      <button type="button" data-moved="true">Yes, it was moved</button>
+  <div class="alerts" x-cloak>
+    <div class="alarm-banner" role="alert" x-show="alarmText">
+      <strong>Alarm</strong>
+      <span x-text="alarmText"></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn caution" @click="machineAction('unlock')" :disabled="off('ready', 'unlock')" :title="why('ready')">Unlock</button>
+      <button type="button" class="btn" @click="machineAction('home')" :disabled="off('ready', 'home')" :title="why('ready')">Home</button>
     </div>
-  </section>
 
-  <main class="layout">
-    <section class="card" aria-labelledby="machine-title">
-      <h2 id="machine-title">Machine</h2>
-      <div class="row">
-        <span id="state" class="chip">-</span>
-        <span id="sys-label" class="sys" title="Active work coordinate system"></span>
-        <span id="feed" class="muted"></span>
+    <section class="check-banner" role="alertdialog" aria-labelledby="pc-title" x-show="check">
+      <div class="check-text">
+        <strong id="pc-title">Did the machine move?</strong>
+        <p x-text="check ? check.question : ''"></p>
+        <p class="detail" x-text="checkDetail"></p>
       </div>
-      <table class="dro">
-        <thead>
-          <tr><th></th><th>X</th><th>Y</th><th>Z</th></tr>
-        </thead>
-        <tbody>
-          <tr class="primary"><th>Work</th>
-            <td id="dro-work-x">-</td><td id="dro-work-y">-</td><td id="dro-work-z">-</td></tr>
-          <tr><th>Machine</th>
-            <td id="dro-mach-x">-</td><td id="dro-mach-y">-</td><td id="dro-mach-z">-</td></tr>
-          <tr><th>Zero</th>
-            <td id="dro-off-x">-</td><td id="dro-off-y">-</td><td id="dro-off-z">-</td></tr>
-        </tbody>
-      </table>
-      <p id="last-error" class="muted" hidden></p>
-      <div class="row">
-        <button type="button" data-action="unlock" data-needs="ready">Unlock</button>
-        <button type="button" data-action="home" data-needs="ready">Home</button>
-        <button type="button" data-action="reset" data-needs="ready" class="danger">Soft reset</button>
+      <div class="check-actions">
+        <button type="button" class="btn go big" @click="answerCheck(false)" :disabled="isBusy('check')">No, it stayed where it was</button>
+        <button type="button" class="btn caution big" @click="answerCheck(true)" :disabled="isBusy('check')">Yes, it was moved</button>
+      </div>
+    </section>
+  </div>
+
+  <main class="deck" x-cloak>
+
+    <div class="col col-left">
+    <!-- Position -->
+    <section class="panel area-pos" data-view="machine" aria-labelledby="pos-title">
+      <header class="panel-head">
+        <h2 id="pos-title">Position</h2>
+        <span class="tag" title="Active work coordinate system" x-text="work ? work.system : '-'"></span>
+      </header>
+
+      <div class="dro" role="group" aria-label="Position readout">
+        <template x-for="axis in axes" :key="axis.key">
+          <div class="dro-row">
+            <span class="dro-axis" x-text="axis.name"></span>
+            <span class="dro-digits" :aria-label="axis.name + ' work ' + axisValue('work', axis.index)">
+              <span class="ghost" aria-hidden="true">88888.888</span>
+              <span class="lit" aria-hidden="true" x-text="digits('work', axis.index)"></span>
+            </span>
+            <span class="dro-sub">
+              <span>MACH <b x-text="axisValue('machine', axis.index)"></b></span>
+              <span>ZERO <b x-text="axisValue('offset', axis.index)"></b></span>
+            </span>
+          </div>
+        </template>
+        <div class="dro-foot">
+          <span>FEED <b x-text="feedText"></b></span>
+          <span>SPINDLE <b x-text="spindleText"></b></span>
+        </div>
+      </div>
+
+      <p class="last-error" x-show="machine &amp;&amp; machine.last_error" x-text="lastErrorText"></p>
+
+      <div class="button-row">
+        <button type="button" class="btn" @click="machineAction('unlock')" :disabled="off('ready', 'unlock')" :title="why('ready')">Unlock</button>
+        <button type="button" class="btn" @click="machineAction('home')" :disabled="off('ready', 'home')" :title="why('ready')">Home</button>
+        <button type="button" class="btn danger" @click="machineAction('reset')" :disabled="off('ready', 'reset')" :title="why('ready')">Soft reset</button>
       </div>
     </section>
 
-    <section class="card" aria-labelledby="jog-title">
-      <h2 id="jog-title">Jog</h2>
-      <div class="jog-pad">
-        <button type="button" class="jog-yp" data-axis="Y" data-sign="1" data-needs="move">Y+</button>
-        <button type="button" class="jog-xm" data-axis="X" data-sign="-1" data-needs="move">X-</button>
-        <button type="button" class="jog-xp" data-axis="X" data-sign="1" data-needs="move">X+</button>
-        <button type="button" class="jog-ym" data-axis="Y" data-sign="-1" data-needs="move">Y-</button>
+    <!-- Jog -->
+    <section class="panel area-jog" data-view="machine" aria-labelledby="jog-title">
+      <header class="panel-head">
+        <h2 id="jog-title">Jog</h2>
+        <span class="tag" x-text="jogStep + ' mm'"></span>
+      </header>
+
+      <div class="jog">
+        <div class="jog-xy">
+          <button type="button" class="key k-yp" @click="jogClick('Y', 1, $event)" :class="{ pressed: pressed === 'Y1' }" :disabled="off('move')" :title="why('move')" aria-label="Jog Y plus">Y+</button>
+          <button type="button" class="key k-xm" @click="jogClick('X', -1, $event)" :class="{ pressed: pressed === 'X-1' }" :disabled="off('move')" :title="why('move')" aria-label="Jog X minus">X&minus;</button>
+          <button type="button" class="stop-jog" @click="cancelJog()" :disabled="off('ready', 'cancel')" :title="why('ready') || 'Cancel jog (Esc)'" aria-label="Cancel jog"><span>Cancel<br>jog</span></button>
+          <button type="button" class="key k-xp" @click="jogClick('X', 1, $event)" :class="{ pressed: pressed === 'X1' }" :disabled="off('move')" :title="why('move')" aria-label="Jog X plus">X+</button>
+          <button type="button" class="key k-ym" @click="jogClick('Y', -1, $event)" :class="{ pressed: pressed === 'Y-1' }" :disabled="off('move')" :title="why('move')" aria-label="Jog Y minus">Y&minus;</button>
+        </div>
+        <div class="jog-z">
+          <button type="button" class="key" @click="jogClick('Z', 1, $event)" :class="{ pressed: pressed === 'Z1' }" :disabled="off('move')" :title="why('move')" aria-label="Jog Z plus">Z+</button>
+          <span class="z-label">Z</span>
+          <button type="button" class="key" @click="jogClick('Z', -1, $event)" :class="{ pressed: pressed === 'Z-1' }" :disabled="off('move')" :title="why('move')" aria-label="Jog Z minus">Z&minus;</button>
+        </div>
       </div>
-      <div class="row">
-        <button type="button" data-axis="Z" data-sign="1" data-needs="move">Z+</button>
-        <button type="button" data-axis="Z" data-sign="-1" data-needs="move">Z-</button>
+
+      <fieldset class="selector">
+        <legend>Step (mm)</legend>
+        <template x-for="step in steps" :key="step">
+          <label :class="{ on: jogStep === step }">
+            <input type="radio" name="jog-step" :value="step" x-model="jogStep" @change="rememberJog()">
+            <span x-text="step"></span>
+          </label>
+        </template>
+      </fieldset>
+
+      <label class="field inline">
+        <span>Feed</span>
+        <input type="number" min="1" step="100" x-model="jogFeed" @change="rememberJog()">
+        <span class="unit">mm/min</span>
+      </label>
+
+      <div class="keys" aria-label="Keyboard">
+        <span><kbd>&larr;</kbd><kbd>&rarr;</kbd> X</span>
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> Y</span>
+        <span><kbd>PgUp</kbd><kbd>PgDn</kbd> Z</span>
+        <span><kbd>Shift</kbd> &times;10</span>
+        <span><kbd>Esc</kbd> cancel</span>
       </div>
-      <div class="row">
-        <label>Step
-          <select id="jog-step">
-            <option value="0.1">0.1 mm</option>
-            <option value="1" selected>1 mm</option>
-            <option value="10">10 mm</option>
-            <option value="50">50 mm</option>
+    </section>
+
+    </div>
+
+    <!-- Job: the selected program, its preview and its controls -->
+    <section class="panel area-job" data-view="job" aria-labelledby="job-title">
+      <header class="panel-head">
+        <h2 id="job-title" :class="{ file: job }" x-text="job ? job.name : 'Job'"></h2>
+        <span class="badge" x-show="job" :data-state="job ? job.state : ''" x-text="job ? job.state : ''"></span>
+      </header>
+
+      <div class="job-top" x-show="job">
+        <svg class="gauge" viewBox="-60 -60 120 104" role="img" :aria-label="'Progress ' + percentText">
+          <g x-ref="gaugeTicks" class="gauge-ticks"></g>
+          <path class="gauge-track" :d="gaugeTrack"></path>
+          <path class="gauge-fill" :d="gaugeFill"></path>
+          <text class="gauge-value" y="8" text-anchor="middle" x-text="percentDigits"></text>
+          <text class="gauge-unit" y="24" text-anchor="middle">PERCENT</text>
+        </svg>
+        <dl class="job-stats">
+          <div><dt>Lines</dt><dd x-text="linesText"></dd></div>
+          <div><dt>File line</dt><dd x-text="fileLineText"></dd></div>
+          <div><dt>Elapsed</dt><dd x-text="elapsedText"></dd></div>
+          <div><dt>Left</dt><dd x-text="remainingText"></dd></div>
+        </dl>
+      </div>
+
+      <div class="meter" x-show="job" aria-hidden="true">
+        <span class="meter-fill" :class="{ running: job &amp;&amp; job.state === 'running' }" :style="{ width: percentWidth }"></span>
+      </div>
+
+      <p class="hint" x-show="job" x-text="hintText"></p>
+      <p class="reason" x-show="job &amp;&amp; job.reason" :class="{ bad: reasonIsBad }" x-text="job ? job.reason : ''"></p>
+
+      <div class="controls" x-show="job">
+        <button type="button" class="btn go big" @click="jobAction('start')" :disabled="off('start', 'start')" :title="why('start')">Start</button>
+        <button type="button" class="btn caution big" @click="jobAction('pause')" :disabled="off('pause', 'pause')" :title="why('pause')">Pause &amp; lift</button>
+        <button type="button" class="btn caution big" @click="jobAction('hold')" :disabled="off('hold', 'hold')" :title="why('hold')">Feed hold</button>
+        <button type="button" class="btn go big" @click="jobAction('resume')" :disabled="off('resume', 'resume')" :title="why('resume')">Resume</button>
+        <button type="button" class="btn stop big" @click="jobAction('stop')" :disabled="off('stop', 'stop')" :title="why('stop')">Stop</button>
+      </div>
+
+      <div class="viewport" x-ref="viewport">
+        <canvas role="img" :aria-label="previewLabel"></canvas>
+        <svg class="rulers" aria-hidden="true"></svg>
+        <span class="readout" aria-hidden="true"></span>
+        <p class="viewport-empty" x-show="previewMessage" x-text="previewMessage"></p>
+        <div class="viewport-tools" x-show="previewReady">
+          <button type="button" @click="zoomPreview(1.5)" aria-label="Zoom in">+</button>
+          <button type="button" @click="zoomPreview(0.667)" aria-label="Zoom out">&minus;</button>
+          <button type="button" @click="fitPreview()" :class="{ lit: previewZoomed }">Fit</button>
+        </div>
+      </div>
+      <div class="legend" x-show="previewReady" aria-hidden="true">
+        <span><i class="sw done"></i>Cut</span>
+        <span><i class="sw pending"></i>To cut</span>
+        <span><i class="sw rapid"></i>Rapid</span>
+        <span x-show="bounds &amp;&amp; bounds.x &amp;&amp; bounds.y"><i class="sw hazard"></i>Boundaries</span>
+        <span><i class="sw tool"></i>Tool</span>
+      </div>
+      <p class="preview-note" x-show="previewNote" :class="{ warn: previewWarns }" x-text="previewNote"></p>
+
+      <ul class="facts" x-show="facts.length">
+        <template x-for="fact in facts" :key="fact.key">
+          <li :class="{ bad: fact.bad }" x-text="fact.text"></li>
+        </template>
+      </ul>
+
+      <details class="resume-options" x-show="job">
+        <summary>Resume options</summary>
+        <div class="field-grid">
+          <label class="field"><span>Retract to Z (mm)</span>
+            <input type="number" step="any" x-model="resumeForm.z"></label>
+          <label class="field"><span>Spindle dwell (s)</span>
+            <input type="number" min="0" step="any" x-model="resumeForm.dwell"></label>
+          <label class="field"><span>From file line</span>
+            <input type="number" min="0" step="1" x-model="resumeForm.line"></label>
+        </div>
+        <label class="check"><input type="checkbox" x-model="resumeForm.acceptZero"> Accept a moved work zero</label>
+      </details>
+
+      <div class="button-row end" x-show="job">
+        <button type="button" class="btn ghost" @click="jobAction('delete')" :disabled="off('delete', 'delete')" :title="why('delete')">Delete program</button>
+      </div>
+    </section>
+
+    <div class="col col-right">
+    <!-- Programs -->
+    <section class="panel area-queue" data-view="job" aria-labelledby="queue-title">
+      <header class="panel-head">
+        <h2 id="queue-title">Programs</h2>
+        <span class="tag" x-text="jobs.length"></span>
+      </header>
+
+      <form class="drop" :class="{ dropping: dropping }" @submit.prevent="upload()"
+            @dragover.prevent="dragOver()" @dragleave="dragLeave()" @drop.prevent="dropFile($event)">
+        <label class="drop-pick">
+          <input type="file" x-ref="file" accept=".nc,.gc,.gcode,.ngc,.tap,.txt" @change="fileChosen()">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0-12-5 5m5-5 5 5M4 17v4h16v-4"/></svg>
+          <span x-text="fileName || 'Choose or drop a G-code file'"></span>
+        </label>
+        <button type="submit" class="btn primary" :disabled="isBusy('upload') || !fileName">Upload</button>
+      </form>
+
+      <ul class="job-list">
+        <li class="empty" x-show="!jobs.length">No programs yet. Upload one above.</li>
+        <template x-for="item in jobsNewestFirst" :key="item.id">
+          <li>
+            <button type="button" class="job-row" @click="select(item.id)" :aria-pressed="item.id === selected ? 'true' : 'false'">
+              <span class="job-name" x-text="item.name"></span>
+              <span class="badge" :data-state="item.state" x-text="item.state"></span>
+              <span class="mini-meter"><span :class="{ running: item.state === 'running' }" :style="{ width: rowPercent(item) }"></span></span>
+              <span class="job-lines" x-text="item.acked_lines + ' / ' + item.total_lines + ' lines'"></span>
+            </button>
+          </li>
+        </template>
+      </ul>
+    </section>
+
+    <!-- Setup: work zero, settings and boundaries -->
+    <section class="panel area-setup" data-view="setup" aria-label="Setup">
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" :aria-selected="setupTab === 'zero' ? 'true' : 'false'" @click="setupTab = 'zero'">Work zero</button>
+        <button type="button" role="tab" :aria-selected="setupTab === 'settings' ? 'true' : 'false'" @click="setupTab = 'settings'">Settings</button>
+        <button type="button" role="tab" :aria-selected="setupTab === 'bounds' ? 'true' : 'false'" @click="setupTab = 'bounds'">Boundaries</button>
+      </div>
+
+      <div class="tab-body" role="tabpanel" x-show="setupTab === 'zero'">
+        <table class="systems">
+          <thead>
+            <tr><th>System</th><th>X</th><th>Y</th><th>Z</th><th></th></tr>
+          </thead>
+          <tbody>
+            <template x-for="sys in systems" :key="sys.name">
+              <tr :class="{ active: sys.active }">
+                <th><span class="led" :class="sys.active ? 'ok' : 'off'"></span><span x-text="sys.name"></span></th>
+                <td x-text="sys.x"></td>
+                <td x-text="sys.y"></td>
+                <td x-text="sys.z"></td>
+                <td>
+                  <span class="active-tag" x-show="sys.active">Active</span>
+                  <button type="button" class="btn small" x-show="!sys.active" @click="useSystem(sys.name)" :disabled="off('move', 'system')" :title="why('move')">Use</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+
+        <label class="field">
+          <span>Change the zero of</span>
+          <select x-model="zeroSystem">
+            <option value="">the active system</option>
+            <option>G54</option><option>G55</option><option>G56</option>
+            <option>G57</option><option>G58</option><option>G59</option>
           </select>
         </label>
-        <label>Feed (mm/min)
-          <input id="jog-feed" type="number" min="1" step="100" value="1000">
-        </label>
-      </div>
-      <button type="button" id="jog-cancel" class="danger" data-needs="ready">Cancel jog</button>
-      <p class="muted keys">Keys: arrows jog X and Y, Page Up and Page Down jog Z, Shift goes ten times as far, Esc cancels.</p>
-    </section>
 
-    <section class="card" aria-labelledby="zero-title">
-      <h2 id="zero-title">Work zero</h2>
-      <table class="systems">
-        <thead>
-          <tr><th>System</th><th>X</th><th>Y</th><th>Z</th><th></th></tr>
-        </thead>
-        <tbody id="systems-body"></tbody>
-      </table>
-      <label class="system-pick">Change the zero of
-        <select id="work-system">
-          <option value="">the active system</option>
-          <option>G54</option><option>G55</option><option>G56</option>
-          <option>G57</option><option>G58</option><option>G59</option>
-        </select>
-      </label>
-      <form id="zero-form">
-        <p class="muted">Call the tool's current position these coordinates. Leave an axis blank to leave it alone.</p>
-        <div class="row">
-          <label>X <input id="zero-x" type="number" step="any"></label>
-          <label>Y <input id="zero-y" type="number" step="any"></label>
-          <label>Z <input id="zero-z" type="number" step="any"></label>
-        </div>
-        <button type="submit" data-needs="move">Set work zero here</button>
-      </form>
-      <form id="offset-form">
-        <p class="muted">Put the zero at these machine coordinates instead. Leave an axis blank to leave it alone.</p>
-        <div class="row">
-          <label>X <input id="offset-x" type="number" step="any"></label>
-          <label>Y <input id="offset-y" type="number" step="any"></label>
-          <label>Z <input id="offset-z" type="number" step="any"></label>
-        </div>
-        <button type="submit" data-needs="move">Set work offset</button>
-      </form>
-    </section>
-
-    <section class="card wide" aria-labelledby="jobs-title">
-      <h2 id="jobs-title">Jobs</h2>
-      <form id="upload-form" class="row">
-        <input id="file" type="file" accept=".nc,.gc,.gcode,.ngc,.tap,.txt">
-        <button type="submit" id="upload-button">Upload program</button>
-      </form>
-      <ul id="job-list" class="job-list"></ul>
-
-      <div id="job-detail" class="job-detail" hidden>
-        <h3 id="job-title"></h3>
-        <div class="row">
-          <span id="job-state" class="badge"></span>
-          <span id="job-counts" class="muted"></span>
-        </div>
-        <progress id="job-progress" value="0" max="1"></progress>
-        <p id="job-times" class="muted"></p>
-        <p id="job-reason" class="reason" hidden></p>
-        <p id="job-hint" class="hint"></p>
-        <div class="row">
-          <button type="button" data-job-action="start" data-needs="start">Start</button>
-          <button type="button" data-job-action="pause" data-needs="pause">Pause and lift tool</button>
-          <button type="button" data-job-action="hold" data-needs="hold">Feed hold</button>
-          <button type="button" data-job-action="resume" data-needs="resume">Resume</button>
-          <button type="button" data-job-action="stop" data-needs="stop" class="danger">Stop</button>
-          <button type="button" data-job-action="delete" data-needs="delete">Delete</button>
-        </div>
-        <ul id="job-facts" class="facts-list"></ul>
-        <canvas id="preview" class="preview" role="img" aria-label="Toolpath preview"></canvas>
-        <p id="preview-note" class="muted"></p>
-        <details class="resume-options">
-          <summary>Resume options</summary>
-          <div class="row">
-            <label>Retract to Z (mm)
-              <input id="resume-z" type="number" step="any">
-            </label>
-            <label>Spindle dwell (s)
-              <input id="resume-dwell" type="number" min="0" step="any">
-            </label>
-            <label>From file line
-              <input id="resume-line" type="number" min="0" step="1">
-            </label>
-            <label class="check">
-              <input id="resume-accept-zero" type="checkbox"> Accept a moved work zero
-            </label>
+        <form class="subform" @submit.prevent="setZero()">
+          <p class="help">Call the tool's current position these coordinates. Leave an axis blank to leave it alone.</p>
+          <div class="axis-inputs">
+            <label><span>X</span><input type="number" step="any" x-model="zeroForm.x"></label>
+            <label><span>Y</span><input type="number" step="any" x-model="zeroForm.y"></label>
+            <label><span>Z</span><input type="number" step="any" x-model="zeroForm.z"></label>
           </div>
-        </details>
+          <button type="submit" class="btn primary" :disabled="off('move', 'zero')" :title="why('move')">Set work zero here</button>
+        </form>
+
+        <form class="subform" @submit.prevent="setOffset()">
+          <p class="help">Put the zero at these machine coordinates instead. Leave an axis blank to leave it alone.</p>
+          <div class="axis-inputs">
+            <label><span>X</span><input type="number" step="any" x-model="offsetForm.x"></label>
+            <label><span>Y</span><input type="number" step="any" x-model="offsetForm.y"></label>
+            <label><span>Z</span><input type="number" step="any" x-model="offsetForm.z"></label>
+          </div>
+          <button type="submit" class="btn" :disabled="off('move', 'offset')" :title="why('move')">Set work offset</button>
+        </form>
+      </div>
+
+      <div class="tab-body" role="tabpanel" x-show="setupTab === 'settings'">
+        <form @submit.prevent="saveSettings()">
+          <label class="check"><input type="checkbox" x-model="settingsForm.lift"> Lift the tool when a job pauses</label>
+          <div class="field-grid">
+            <label class="field"><span>Lift height (mm)</span>
+              <input type="number" min="0" step="any" x-model="settingsForm.height"></label>
+            <label class="field"><span>Lift to Z instead (mm)</span>
+              <input type="number" step="any" placeholder="none" x-model="settingsForm.z"></label>
+            <label class="field"><span>Spindle dwell on resume (s)</span>
+              <input type="number" min="0" max="60" step="any" x-model="settingsForm.dwell"></label>
+          </div>
+          <label class="check"><input type="checkbox" x-model="settingsForm.trust"> After a reset, keep the tool where it was recorded</label>
+          <div class="button-row">
+            <button type="submit" class="btn primary" :disabled="isBusy('settings')">Save settings</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="tab-body" role="tabpanel" x-show="setupTab === 'bounds'">
+        <p class="help">Machine coordinates, in mm. Leave an axis blank to leave it unchecked.</p>
+        <form @submit.prevent="saveBounds()">
+          <div class="bounds">
+            <span></span><span class="col">Min</span><span class="col">Max</span>
+            <span class="axis-name">X</span>
+            <input type="number" step="any" aria-label="X minimum" x-model="boundsForm.xmin">
+            <input type="number" step="any" aria-label="X maximum" x-model="boundsForm.xmax">
+            <span class="axis-name">Y</span>
+            <input type="number" step="any" aria-label="Y minimum" x-model="boundsForm.ymin">
+            <input type="number" step="any" aria-label="Y maximum" x-model="boundsForm.ymax">
+            <span class="axis-name">Z</span>
+            <input type="number" step="any" aria-label="Z minimum" x-model="boundsForm.zmin">
+            <input type="number" step="any" aria-label="Z maximum" x-model="boundsForm.zmax">
+          </div>
+          <div class="button-row">
+            <button type="submit" class="btn primary" :disabled="isBusy('bounds')">Save boundaries</button>
+            <button type="button" class="btn danger" @click="clearBounds()" :disabled="isBusy('boundsClear')">Clear boundaries</button>
+          </div>
+        </form>
       </div>
     </section>
-
-    <section class="card" aria-labelledby="settings-title">
-      <h2 id="settings-title">Settings</h2>
-      <form id="settings-form">
-        <label class="check">
-          <input id="set-lift" type="checkbox"> Lift the tool when a job pauses
-        </label>
-        <label>Lift height (mm)
-          <input id="set-height" type="number" min="0" step="any">
-        </label>
-        <label>Lift to Z instead (mm, blank for none)
-          <input id="set-z" type="number" step="any">
-        </label>
-        <label>Spindle dwell on resume (s)
-          <input id="set-dwell" type="number" min="0" max="60" step="any">
-        </label>
-        <label class="check">
-          <input id="set-trust" type="checkbox"> After a reset, keep the tool where it was recorded
-        </label>
-        <div class="row">
-          <button type="submit">Save settings</button>
-        </div>
-      </form>
-    </section>
-
-    <section class="card" aria-labelledby="bounds-title">
-      <h2 id="bounds-title">Boundaries</h2>
-      <p class="muted">Machine coordinates, in mm. Leave an axis blank to leave it unchecked.</p>
-      <form id="bounds-form">
-        <div class="bounds">
-          <span></span><span class="muted">Min</span><span class="muted">Max</span>
-          <span>X</span>
-          <input id="bx-min" type="number" step="any" aria-label="X minimum">
-          <input id="bx-max" type="number" step="any" aria-label="X maximum">
-          <span>Y</span>
-          <input id="by-min" type="number" step="any" aria-label="Y minimum">
-          <input id="by-max" type="number" step="any" aria-label="Y maximum">
-          <span>Z</span>
-          <input id="bz-min" type="number" step="any" aria-label="Z minimum">
-          <input id="bz-max" type="number" step="any" aria-label="Z maximum">
-        </div>
-        <div class="row">
-          <button type="submit">Save boundaries</button>
-          <button type="button" id="bounds-clear" class="danger">Clear boundaries</button>
-        </div>
-      </form>
-    </section>
+    </div>
   </main>
+
+  <!-- On a phone, one part of the panel at a time. -->
+  <nav class="dock" aria-label="Sections" x-cloak>
+    <button type="button" @click="show('machine')" :aria-current="view === 'machine' ? 'page' : 'false'">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3m3-3 3 3M12 21l-3-3m3 3 3-3M3 12l3-3m-3 3 3 3m15-3-3-3m3 3-3 3"/></svg>
+      Machine
+    </button>
+    <button type="button" @click="show('job')" :aria-current="view === 'job' ? 'page' : 'false'">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20 9 9l4 6 3-4 4 9z"/></svg>
+      <span>Job</span><b x-show="dockPercent" x-text="dockPercent"></b>
+    </button>
+    <button type="button" @click="show('setup')" :aria-current="view === 'setup' ? 'page' : 'false'">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10m4 0h2M4 12h4m4 0h8M4 18h12m4 0h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+      Setup
+    </button>
+  </nav>
+
+  <div class="toast" role="alert" x-show="notice" x-cloak>
+    <span x-text="notice"></span>
+    <button type="button" @click="notice = ''" aria-label="Dismiss">&times;</button>
+  </div>
 </body>
 </html>

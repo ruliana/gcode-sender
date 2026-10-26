@@ -56,7 +56,15 @@ async fn the_web_ui_is_served_with_a_strict_policy() {
             .contains("<title>G-code Sender</title>")
     );
 
-    for (path, kind) in [("/app.js", "javascript"), ("/style.css", "text/css")] {
+    // Everything the page loads comes from the sender itself, so it works
+    // with no internet access.
+    for (path, kind) in [
+        ("/app.js", "javascript"),
+        ("/style.css", "text/css"),
+        ("/vendor/alpine-csp-3.17.5.min.js", "javascript"),
+        ("/vendor/d3-7.9.0.min.js", "javascript"),
+        ("/vendor/fonts/DSEG7Classic-Bold.woff2", "font/woff2"),
+    ] {
         let res = client
             .get(format!("{}{path}", h.base))
             .send()
