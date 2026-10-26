@@ -47,8 +47,10 @@ async fn released(h: &Harness, id: &str) -> Value {
             j["state"] == "paused" && !j["paused_at"].is_null()
         })
         .await;
+    // Resume is refused until the controller is ready again, which can lag
+    // behind Idle after the tool lifts, so wait for both.
     h.wait_machine("the machine to be free", |m| {
-        m["active_job"].is_null() && m["status"]["state"] == "Idle"
+        m["active_job"].is_null() && m["status"]["state"] == "Idle" && m["ready"] == true
     })
     .await;
     job
