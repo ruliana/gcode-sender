@@ -47,8 +47,10 @@ async fn released(h: &Harness, id: &str) -> Value {
             j["state"] == "paused" && !j["paused_at"].is_null()
         })
         .await;
+    // Resume is refused until the controller is ready again, which can lag
+    // behind Idle after the tool lifts, so wait for both.
     h.wait_machine("the machine to be free", |m| {
-        m["active_job"].is_null() && m["status"]["state"] == "Idle"
+        m["active_job"].is_null() && m["status"]["state"] == "Idle" && m["ready"] == true
     })
     .await;
     job
@@ -441,7 +443,8 @@ async fn settings_have_defaults_and_are_kept() {
         body,
         json!({
             "pause": {"lift": true, "height": 10.0, "z": null, "dwell_s": 3.0},
-            "position": {"trust_record": true}
+            "position": {"trust_record": true},
+            "jog": {"xy_feed": 1000.0, "z_feed": 300.0}
         })
     );
 
@@ -452,7 +455,8 @@ async fn settings_have_defaults_and_are_kept() {
     .await;
     let expected = json!({
         "pause": {"lift": false, "height": 4.0, "z": -2.5, "dwell_s": 3.0},
-        "position": {"trust_record": true}
+        "position": {"trust_record": true},
+        "jog": {"xy_feed": 1000.0, "z_feed": 300.0}
     });
     assert_eq!(h.get("/settings").await.1, expected);
 
@@ -464,7 +468,6 @@ async fn settings_have_defaults_and_are_kept() {
         json!({"pause": {"dwell_s": 120}}),
         json!({"pause": {"lift": "yes"}}),
         json!({"pause": {"speed": 1}}),
-        json!({"jog": {}}),
     ] {
         let (status, _) = h.put_json("/settings", &bad).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");

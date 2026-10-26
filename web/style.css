@@ -567,6 +567,7 @@ input[type="checkbox"] { width: 1.15rem; height: 1.15rem; accent-color: var(--ac
 
 .field.inline { flex-direction: row; align-items: center; gap: 0.6rem; }
 .field.inline input { width: 7rem; }
+.feed-pair { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; }
 .unit { color: var(--muted); font-size: 0.85rem; }
 
 .field-grid {

@@ -141,11 +141,18 @@
         </template>
       </fieldset>
 
-      <label class="field inline">
-        <span>Feed</span>
-        <input type="number" min="1" step="100" x-model="jogFeed" @change="rememberJog()">
-        <span class="unit">mm/min</span>
-      </label>
+      <div class="feed-pair">
+        <label class="field inline">
+          <span>XY feed</span>
+          <input type="number" min="1" step="100" x-model="jogForm.xy" @change="saveJogFeeds()" aria-label="XY jog feed, mm per minute">
+          <span class="unit">mm/min</span>
+        </label>
+        <label class="field inline">
+          <span>Z feed</span>
+          <input type="number" min="1" step="50" x-model="jogForm.z" @change="saveJogFeeds()" aria-label="Z jog feed, mm per minute">
+          <span class="unit">mm/min</span>
+        </label>
+      </div>
 
       <div class="keys" aria-label="Keyboard">
         <span><kbd>&larr;</kbd><kbd>&rarr;</kbd> X</span>
