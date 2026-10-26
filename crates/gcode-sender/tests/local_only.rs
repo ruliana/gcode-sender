@@ -1,6 +1,6 @@
-//! The sender serves only the machine it runs on: it refuses to listen on
-//! anything but a loopback address, and it refuses requests that did not
-//! come from this machine's own pages.
+//! The machine's own pages reach the sender without a code. Requests from
+//! other places need a paired browser, and pages of other sites are refused
+//! outright.
 
 mod common;
 
@@ -12,14 +12,9 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 #[test]
-fn the_server_refuses_to_listen_beyond_loopback() {
+fn the_plain_http_listener_must_stay_on_loopback() {
     let dir = tempfile::tempdir().unwrap();
-    for listen in [
-        "0.0.0.0:0",
-        "192.168.1.10:8080",
-        "[::]:8080",
-        "localhost:8080",
-    ] {
+    for listen in ["0.0.0.0:0", "192.168.1.10:8080", "[::]:8080"] {
         let out = Command::new(env!("CARGO_BIN_EXE_gcode-sender"))
             .args(["--port", "/dev/null", "--listen", listen, "--data-dir"])
             .arg(dir.path())
@@ -28,7 +23,25 @@ fn the_server_refuses_to_listen_beyond_loopback() {
         assert!(!out.status.success(), "{listen} should be refused");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("loopback") || err.contains("IP address"),
+            err.contains("loopback"),
+            "{listen}: unexpected message: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_listen_address_must_be_an_ip_address_and_port() {
+    let dir = tempfile::tempdir().unwrap();
+    for listen in ["localhost:8080", "8080", "127.0.0.1"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_gcode-sender"))
+            .args(["--port", "/dev/null", "--listen", listen, "--data-dir"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{listen} should be refused");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("IP address"),
             "{listen}: unexpected message: {err}"
         );
     }
@@ -77,26 +90,22 @@ async fn the_web_ui_is_served_with_a_strict_policy() {
 }
 
 #[tokio::test]
-async fn a_request_under_another_host_name_is_refused() {
+async fn a_request_under_another_host_name_needs_a_pairing_code() {
     let h = Harness::start_unready(SimConfig::grbl()).await;
     let client = reqwest::Client::new();
 
     // What a page on another site looks like after DNS rebinding points its
-    // name at this machine.
+    // name at this machine. It is not this machine's own page, so it has no
+    // token and gets no access.
     let res = client
         .get(format!("{}/jobs", h.base))
         .header("host", "evil.example:8080")
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     let body: Value = res.json().await.unwrap();
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("machine it runs on")
-    );
+    assert_eq!(body["pairing"], true);
 }
 
 #[tokio::test]

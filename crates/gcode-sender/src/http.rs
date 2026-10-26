@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -24,6 +24,7 @@ use crate::controller::{
     AxisValues, ControlError, ControllerHandle, JogRequest, MachineAction, MachineSnapshot,
     ResumeOptions, WorkChange,
 };
+use crate::pairing::{Access, Pairing, PairingView, RedeemError};
 use crate::settings::{PauseOptions, Settings};
 use crate::store::{JobRecord, JobStore};
 
@@ -31,14 +32,32 @@ use crate::store::{JobRecord, JobStore};
 pub struct AppState {
     pub store: Arc<JobStore>,
     pub controller: ControllerHandle,
+    pub pairing: Arc<Pairing>,
     /// Turns true when the server is shutting down, to end open event streams.
     pub shutdown: watch::Receiver<bool>,
+    /// True for the plain-HTTP listener on this machine, false for the HTTPS
+    /// listener that remote browsers use. Only the first is trusted without a
+    /// token.
+    pub local: bool,
 }
 
+/// The name of the cookie that holds a paired browser's token.
+const SESSION_COOKIE: &str = "gcode_sender_session";
+
+/// A paired browser keeps its token for as long as it is not revoked.
+const SESSION_MAX_AGE: u64 = 10 * 365 * 24 * 60 * 60;
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Pages and the calls that let a browser pair. Anyone who can reach the
+    // sender can load these; none of them changes the machine.
+    let public = Router::new()
         .merge(crate::web::routes())
         .route("/health", get(health))
+        .route("/session", get(session))
+        .route("/pairing", get(pairing_view).post(pair));
+
+    // Everything else needs the machine's own pages or a paired browser.
+    let api = Router::new()
         .route("/events", get(events))
         .route("/machine", get(machine))
         .route("/machine/unlock", post(unlock))
@@ -62,40 +81,118 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}/pause", post(pause_job))
         .route("/jobs/{id}/resume", post(resume_job))
         .route("/jobs/{id}/stop", post(stop_job))
+        .route("/pairing/code", post(new_pairing_code))
+        .route("/pairing/devices/{id}", delete(revoke_device))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_access,
+        ));
+
+    public
+        .merge(api)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
-        .layer(middleware::from_fn(local_only))
+        .layer(middleware::from_fn(same_origin))
         .with_state(state)
 }
 
-/// Serves only requests that came from this machine's own pages. The sender
-/// drives a machine, so a web page open in the same browser must not be able
-/// to reach it. The `Host` header has to name a loopback address, which stops
-/// DNS rebinding from making a remote site look local. When a browser sends an
-/// `Origin`, it has to be a loopback page too, so another site cannot send a
-/// jog through the visitor's browser.
-async fn local_only(req: Request, next: Next) -> Response {
-    let host_ok = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(is_loopback_authority);
-    let origin_ok = match req.headers().get(header::ORIGIN) {
-        None => true,
-        Some(origin) => origin
-            .to_str()
-            .ok()
-            .and_then(|o| o.strip_prefix("http://"))
-            .is_some_and(is_loopback_authority),
-    };
-    if host_ok && origin_ok {
+/// Refuses requests that a page from another site made in the visitor's
+/// browser. A browser marks such a request with a `Sec-Fetch-Site` other
+/// than `same-origin` or `none`, and it sends an `Origin` that is not this
+/// sender's own address. Requests without either header come from programs
+/// such as `curl`, and they are judged by the token check instead.
+async fn same_origin(mut req: Request, next: Next) -> Response {
+    // Browsers speaking HTTP/2 send the host as `:authority` rather than a
+    // `Host` header. The rest of the checks read `Host`, so take it from there.
+    if !req.headers().contains_key(header::HOST)
+        && let Some(authority) = req.uri().authority()
+        && let Ok(host) = HeaderValue::from_str(authority.as_str())
+    {
+        req.headers_mut().insert(header::HOST, host);
+    }
+    if origin_is_ours(req.headers()) {
         next.run(req).await
     } else {
         ApiError(
             StatusCode::FORBIDDEN,
-            "this sender only serves requests from the machine it runs on".into(),
+            "requests must come from this sender's own pages".into(),
         )
         .into_response()
     }
+}
+
+fn origin_is_ours(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if let Some(site) = headers.get("sec-fetch-site")
+        && !matches!(site.to_str(), Ok("same-origin" | "none"))
+    {
+        return false;
+    }
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(origin) => origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .is_some_and(|(scheme, authority)| {
+                matches!(scheme, "http" | "https") && authority.eq_ignore_ascii_case(host)
+            }),
+    }
+}
+
+/// Serves requests from this machine's own pages without a token, and other
+/// requests only with a token from a paired browser.
+async fn require_access(State(app): State<AppState>, mut req: Request, next: Next) -> Response {
+    match access_of(app.local, req.headers(), &app.pairing) {
+        Some(access) => {
+            req.extensions_mut().insert(access);
+            next.run(req).await
+        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "pair this browser with the code shown on the sender",
+                "pairing": true,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Who a request comes from. A request is this machine's own page when it
+/// arrived on the plain-HTTP listener, which only listens on loopback, and
+/// its `Host` names a loopback address. That `Host` check stops a page of
+/// another site from reaching this listener by DNS rebinding. Every other
+/// request needs a token from a paired browser, including one from this
+/// machine that came in over the HTTPS listener.
+fn access_of(local: bool, headers: &HeaderMap, pairing: &Pairing) -> Option<Access> {
+    let host_is_loopback = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_loopback_authority);
+    if local && host_is_loopback {
+        return Some(Access::Local);
+    }
+    let token = token_of(headers)?;
+    pairing.is_paired(token).then_some(Access::Paired)
+}
+
+/// The token a browser or program presents: a `Bearer` authorization, or the
+/// session cookie that pairing sets.
+fn token_of(headers: &HeaderMap) -> Option<&str> {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        return auth.strip_prefix("Bearer ").map(str::trim);
+    }
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())?
+        .split(';')
+        .filter_map(|pair| pair.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
+        .next()
 }
 
 /// Whether an authority (`host`, or `host:port`, with IPv6 in brackets) names
@@ -162,6 +259,118 @@ fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<Option<T
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// Who is asking, so the page knows whether to ask for a pairing code.
+async fn session(State(app): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let access = match access_of(app.local, &headers, &app.pairing) {
+        Some(Access::Local) => "local",
+        Some(Access::Paired) => "paired",
+        None => "none",
+    };
+    Json(json!({ "access": access }))
+}
+
+/// Pairing is managed from the machine's own screen, so a paired browser
+/// cannot see the code or revoke another browser.
+fn require_local(app: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    match access_of(app.local, headers, &app.pairing) {
+        Some(Access::Local) => Ok(()),
+        _ => Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "pairing is managed from the machine the sender runs on".into(),
+        )),
+    }
+}
+
+/// The code to show on the machine, and the browsers paired so far.
+async fn pairing_view(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<PairingView>> {
+    require_local(&app, &headers)?;
+    Ok(Json(app.pairing.view()))
+}
+
+#[derive(Deserialize)]
+struct PairRequest {
+    code: String,
+}
+
+/// Pairs a browser: a correct code gives it a token, kept in a cookie and
+/// also returned for programs that send `Authorization: Bearer`.
+async fn pair(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PairRequest>,
+) -> ApiResult<Response> {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = app
+        .pairing
+        .redeem(&request.code, user_agent)
+        .map_err(|e| match e {
+            RedeemError::NoCode => ApiError(
+                StatusCode::FORBIDDEN,
+                "there is no code showing on the sender; read the current one from its screen"
+                    .into(),
+            ),
+            RedeemError::Wrong { left: 0 } => ApiError(
+                StatusCode::FORBIDDEN,
+                "that code is wrong, and no tries are left; read the new code from the sender's screen"
+                    .into(),
+            ),
+            RedeemError::Wrong { left } => ApiError(
+                StatusCode::FORBIDDEN,
+                format!("that code is wrong; {left} more tries"),
+            ),
+            RedeemError::Storage(e) => e.into(),
+        })?;
+    // Only the HTTPS listener sends the cookie over TLS, so only there is it
+    // marked Secure.
+    let secure = if app.local { "" } else { "; Secure" };
+    let cookie = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE}{secure}"
+    );
+    let mut res = (
+        StatusCode::CREATED,
+        Json(json!({ "access": "paired", "token": token })),
+    )
+        .into_response();
+    res.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("the cookie is ASCII"),
+    );
+    Ok(res)
+}
+
+/// Makes a new code, replacing the one on screen.
+async fn new_pairing_code(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<PairingView>> {
+    require_local(&app, &headers)?;
+    app.pairing.new_code();
+    Ok(Json(app.pairing.view()))
+}
+
+/// Forgets a paired browser, whose token stops working at once.
+async fn revoke_device(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_local(&app, &headers)?;
+    if app.pairing.revoke(&id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "no paired browser has that id".into(),
+        ))
+    }
 }
 
 async fn machine(State(app): State<AppState>) -> impl IntoResponse {

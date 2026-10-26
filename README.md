@@ -77,24 +77,49 @@ one-line hint about what to do next.
 ![An alarm](docs/screenshots/alarm.png)
 ![Phone](docs/screenshots/phone.png)
 
-## Local only
+## Remote access
 
-The sender and its UI are for the machine the controller is plugged into, and
-that is a requirement, not a default:
+The machine itself uses plain HTTP on `--listen`, which defaults to
+`127.0.0.1:8080`. That address must be a loopback address, so only this
+machine can reach it. Its own pages need no code.
 
-- `--listen` must be a loopback address (`127.0.0.1` or `[::1]`, with a port).
-  The sender refuses to start with any other address, including `0.0.0.0`,
-  and it does not accept `localhost` by name. There is no option to override it.
-- Every request must name a loopback host in its `Host` header, which stops
-  DNS rebinding from making a remote site look local. A browser request that
-  carries an `Origin` must come from a loopback page. Other sites therefore
-  cannot send commands, such as a jog, through the browser of someone who
-  happens to be using the sender. Such requests get `403`.
+Other computers use HTTPS on `--remote`, which defaults to `0.0.0.0:8443`.
+Pass `--no-remote` to turn that off. The sender makes a self-signed
+certificate on first run and keeps it in `data/tls/`, so it stays the same
+across restarts. Each browser warns that the certificate is not trusted, and
+you accept it once. To pair:
 
-Open the UI at `http://127.0.0.1:8080/` (or `http://localhost:8080/`) on the
-machine itself. To use it from another computer, reach the machine over a
-remote desktop session or an SSH tunnel to its loopback port, not by changing
-`--listen`.
+1. On the machine, open the UI and go to **Setup → Remote access**. It shows a
+   six-digit code, valid for five minutes.
+2. On the other device, open `https://<machine>:8443/`, accept the certificate
+   warning, and enter the code.
+3. The browser keeps a session cookie and stays paired until you revoke it on
+   the same tab. Five wrong guesses use up a code, and the machine then shows a
+   new one.
+
+Programs pair the same way: `POST /pairing` with `{"code": "123456"}` returns a
+`token`, which they send as `Authorization: Bearer <token>`. Use `-k` with curl,
+since the certificate is self-signed.
+
+Protections against other sites, paired or not:
+
+- A request made by a page of another site is refused with `403`. A browser
+  marks such requests with `Sec-Fetch-Site`, and they carry an `Origin` that is
+  not the sender's own address. A jog cannot be sent through the browser of a
+  visitor who happens to be using the sender.
+- The session cookie is `HttpOnly`, `SameSite=Strict` and `Secure`.
+- Only the plain-HTTP listener on this machine is trusted without a token. A
+  request that comes in over HTTPS always needs a paired browser, even from
+  this machine.
+- Tokens are kept as SHA-256 hashes in `data/devices.json`, so the file does
+  not hold anything that works as a login. Paired browsers survive a restart.
+- Pairing is managed only from the machine itself (`GET /pairing`,
+  `POST /pairing/code` and `DELETE /pairing/devices/{id}`).
+
+The certificate is self-signed, so the browser cannot confirm that it is talking
+to this sender. Anyone who can intercept the first connection could impersonate
+the sender. Use remote access on a network you trust, or reach the sender
+through a VPN or an SSH tunnel.
 
 ## Supported controllers
 
@@ -120,7 +145,9 @@ cargo run --release -p gcode-sender -- --port /dev/ttyACM0 --data-dir ./data
 | --- | --- | --- |
 | `--port` | (required) | Serial port of the controller |
 | `--baud` | `115200` | Baud rate |
-| `--listen` | `127.0.0.1:8080` | HTTP address, which must be loopback; port `0` picks a free one. See [Local only](#local-only) |
+| `--listen` | `127.0.0.1:8080` | HTTP address for this machine. It must be loopback; port `0` picks a free one. See [Remote access](#remote-access) |
+| `--remote` | `0.0.0.0:8443` | HTTPS address for remote browsers, with a self-signed certificate. See [Remote access](#remote-access) |
+| `--no-remote` | off | Serve only this machine, with no remote browsers |
 | `--data-dir` | `./data` | Where jobs are stored |
 | `--rx-reserve` | `8` | Bytes of the RX buffer left unused as a margin |
 | `--poll-ms` | `200` | Status report interval |

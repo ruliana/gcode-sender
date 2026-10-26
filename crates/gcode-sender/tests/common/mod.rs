@@ -26,6 +26,8 @@ pub struct Harness {
     pub sim: Simulator,
     server: Option<Child>,
     pub base: String,
+    /// The HTTPS address that remote browsers use.
+    pub remote: String,
     client: reqwest::Client,
     data_dir: PathBuf,
     _dir: TempDir,
@@ -48,6 +50,7 @@ impl Harness {
             sim,
             server: None,
             base: String::new(),
+            remote: String::new(),
             client: reqwest::Client::new(),
             data_dir,
             _dir: dir,
@@ -63,6 +66,8 @@ impl Harness {
             .arg(self.sim.port())
             .args([
                 "--listen",
+                "127.0.0.1:0",
+                "--remote",
                 "127.0.0.1:0",
                 "--poll-ms",
                 "50",
@@ -82,13 +87,22 @@ impl Harness {
         let mut child = cmd.spawn().expect("spawn gcode-sender");
         let stdout = child.stdout.take().unwrap();
         let mut lines = BufReader::new(stdout).lines();
-        let line = tokio::time::timeout(TIMEOUT, lines.next_line())
+        let local = tokio::time::timeout(TIMEOUT, lines.next_line())
             .await
             .expect("server did not start in time")
             .unwrap()
             .expect("server exited before listening");
-        let addr = line.strip_prefix("listening on ").expect("listen line");
+        let addr = local.strip_prefix("listening on ").expect("listen line");
+        let remote = tokio::time::timeout(TIMEOUT, lines.next_line())
+            .await
+            .expect("server did not start in time")
+            .unwrap()
+            .expect("server exited before the remote listener");
+        let remote = remote
+            .strip_prefix("remote listening on ")
+            .expect("remote listen line");
         self.base = format!("http://{addr}");
+        self.remote = remote.to_string();
         self.server = Some(child);
     }
 
