@@ -19,43 +19,63 @@ This is a monorepo.
 | --- | --- |
 | `crates/gcode-sender` | The sender: serial link, job streaming, HTTP API, and the web UI it serves |
 | `crates/grbl-sim` | A simulated controller on a pseudo-terminal, used by the tests |
-| `web/` | The web UI: `index.html`, `style.css`, `app.js`, and `lib.js` (the pure logic, with tests in `lib.test.js`). Plain files, no build step |
+| `web/` | The web UI: `index.html`, `style.css`, `app.js` (the page, an Alpine component), `preview.js` (the toolpath viewport, with d3), `lib.js` (the pure logic, with tests in `lib.test.js`), and `vendor/` (Alpine, d3 and two fonts). Plain files, no build step |
 
 The web UI is compiled into the sender binary (`crates/gcode-sender/src/web.rs`),
 so the server is the only thing to copy onto the machine. Edit the files in
-`web/` and rebuild. The UI is plain ES5-style script and needs no build tools;
-the logic that can be wrong without anyone noticing (the toolpath parser, time
-estimates, key mapping) lives in `web/lib.js` and is checked with
+`web/` and rebuild. There are no build tools: the page uses
+[Alpine.js](https://alpinejs.dev) (its CSP build, so the page's strict content
+security policy stays) and [d3](https://d3js.org), both copied into
+`web/vendor/` with the fonts, so the page loads nothing from the internet. See
+`web/vendor/README.md` for where each file came from. It targets current
+browsers. The logic that can be wrong without anyone noticing (the toolpath
+parser, time estimates, key mapping) lives in `web/lib.js` and is checked with
 `node --test web/lib.test.js`.
 
 ## Web UI
+
+The UI is laid out like a machine's control panel: a stack light that says
+what the controller is doing (green when fine, blinking while it moves, amber
+when it waits on you, red for an alarm or no controller), a seven-segment
+position readout, a jog pad with a cancel button in the middle, and the job's
+toolpath on a dark viewport. It has a light and a dark theme (it follows the
+system until you pick one with the button in the header), and on a phone a
+dock at the bottom switches between Machine, Job and Setup.
 
 The UI only offers what the machine can do right now. A button that cannot
 work is disabled and says why when you hover it, and the selected job shows a
 one-line hint about what to do next.
 
-- **Machine**: work, machine, and zero readouts for X, Y and Z, the active
-  work system, and the tab title shows state and job progress, so you can
-  watch from another window.
+- **Position**: the work position large, with machine position and zero
+  under each axis, feed and spindle, and the active work system. The tab title
+  shows state and job progress, so you can watch from another window.
 - **Jog**: buttons, or the keyboard: arrow keys for X and Y, Page Up and Page
   Down for Z, Shift for ten times the step, Esc to cancel. Keys are ignored
-  while typing in a field.
-- **Work zero**: all of G54 to G59 with their zeros, one click to switch, and
-  the zero forms apply to the system you pick.
+  while typing in a field. The step and feed are remembered.
+- **Job**: start, pause with tool lift, feed hold, resume (with options),
+  stop. A dial and a bar show progress, with elapsed and estimated remaining
+  time and why a job paused or failed. The toolpath is drawn from the exact
+  program that was uploaded (`GET /jobs/{id}/program`): what has been cut,
+  what is left, rapids, the boundaries and the tool, with rulers in mm. Drag
+  to pan, scroll or pinch to zoom, Fit to go back; the pointer's position is
+  shown in the corner. It warns if the program would leave the boundaries
+  from the current work zero.
+- **Programs**: choose or drop a file to upload; the list shows each job's
+  state and progress.
+- **Setup**: **Work zero** lists G54 to G59 with their zeros, switches with
+  one click, and the zero forms apply to the system you pick. **Settings** and
+  **Boundaries**: saving a setting keeps the ones the form does not show.
 - **Position check**: after a reset or a lost connection, the sender asks
   whether the machine was moved. The UI shows that question at the top of the
   page with both answers, and says when jobs are waiting for the answer.
-- **Jobs**: upload, start, pause with tool lift, feed hold, resume (with
-  options), stop. It shows elapsed and estimated remaining time, why a job
-  paused or failed, and a preview of the toolpath drawn from the exact program
-  that was uploaded (`GET /jobs/{id}/program`), with a warning if it would
-  leave the boundaries from the current work zero.
-- **Settings** and **Boundaries**: saving a setting keeps the ones the form
-  does not show.
+- **Alarm**: a striped banner with Unlock and Home.
 
 ![Overview](docs/screenshots/overview.png)
-![A paused job](docs/screenshots/job-paused.png)
+![A job running](docs/screenshots/job-running.png)
+![A paused job, light theme](docs/screenshots/job-paused.png)
 ![The position check](docs/screenshots/position-check.png)
+![An alarm](docs/screenshots/alarm.png)
+![Phone](docs/screenshots/phone.png)
 
 ## Local only
 

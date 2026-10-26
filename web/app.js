@@ -1,58 +1,28 @@
 // The G-code Sender web UI. It is one page over the HTTP API that serves it,
-// and it talks to nothing else. It is a plain script with no build step and
-// avoids newer syntax, so it runs in older browsers. The logic that needs no
-// DOM (the toolpath parser, time estimates, guidance) is in lib.js, which has
-// its own tests.
+// and it talks to nothing else. The page is an Alpine component (`sender`):
+// this file keeps the state and the actions, and index.html says how they
+// look. Alpine is its CSP build, so the expressions in index.html stay simple:
+// anything with logic in it is a getter or a method here. The logic that needs
+// no DOM (the toolpath parser, time estimates, guidance) is in lib.js, which
+// has its own tests, and the toolpath viewport is in preview.js.
 (function () {
   "use strict";
 
   var Lib = window.SenderLib;
-  var AXES = ["X", "Y", "Z"];
+  var AXIS_NAMES = ["X", "Y", "Z"];
   var AXIS_KEYS = ["x", "y", "z"];
   var FIRMWARE_NAMES = { grbl: "Grbl", grblhal: "grblHAL" };
   var STARTABLE = ["loaded", "completed", "stopped"];
   var DELETABLE = ["loaded", "completed", "stopped", "failed", "interrupted"];
   var RESUMABLE_AFTER_STOP = ["interrupted", "stopped", "failed"];
   var ACTIVE_STATES = ["running", "paused", "stopping"];
+  var STEPS = ["0.1", "1", "10", "50"];
+  var THEMES = ["auto", "dark", "light"];
   var BASE_TITLE = "G-code Sender";
+  var GAUGE_START = -0.75 * Math.PI;
+  var GAUGE_SWEEP = 1.5 * Math.PI;
 
-  var model = {
-    machine: null,
-    jobs: [], // job records, oldest first
-    selected: null, // id of the job shown in the detail panel
-    settings: null, // the last settings document the server sent
-    bounds: null, // the last boundaries the server sent
-  };
-
-  function $(id) {
-    return document.getElementById(id);
-  }
-
-  // Builds an element. Text goes in through textContent, never innerHTML, so
-  // a job name cannot inject markup.
-  function h(tag, attrs) {
-    var node = document.createElement(tag);
-    Object.keys(attrs || {}).forEach(function (name) {
-      var value = attrs[name];
-      if (name === "text") {
-        node.textContent = value;
-      } else if (value === true) {
-        node.setAttribute(name, "");
-      } else if (value !== false && value !== null && value !== undefined) {
-        node.setAttribute(name, value);
-      }
-    });
-    for (var i = 2; i < arguments.length; i++) {
-      node.appendChild(arguments[i]);
-    }
-    return node;
-  }
-
-  function setText(id, text) {
-    var node = $(id);
-    node.textContent = text || "";
-    node.hidden = !text;
-  }
+  // ---- Browser storage --------------------------------------------------
 
   // What the operator last chose, kept in the browser. It is a convenience:
   // storage can be blocked, so every access is allowed to fail.
@@ -72,6 +42,17 @@
       // Not remembered; nothing depends on it.
     }
   }
+
+  function applyTheme(theme) {
+    if (theme === "auto") {
+      document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.setAttribute("data-theme", theme);
+    }
+  }
+
+  // Before the page is drawn, so it does not flash the other theme.
+  applyTheme(remembered("theme", "auto"));
 
   // ---- HTTP -------------------------------------------------------------
 
@@ -117,79 +98,11 @@
     });
   }
 
-  // ---- Feedback ---------------------------------------------------------
-
-  var noticeTimer = null;
-
-  function notify(error) {
-    var box = $("notice");
-    box.textContent = error && error.message ? error.message : String(error);
-    box.hidden = false;
-    clearTimeout(noticeTimer);
-    noticeTimer = setTimeout(function () {
-      box.hidden = true;
-    }, 10000);
-  }
-
-  // Runs one user action. The button is disabled while it is in flight, and
-  // any error is shown in the notice bar.
-  function act(button, action) {
-    if (button) {
-      button.disabled = true;
-    }
-    return Promise.resolve()
-      .then(action)
-      .catch(notify)
-      .then(function () {
-        if (button) {
-          button.disabled = false;
-        }
-        applyEnabled();
-      });
-  }
-
-  function setLive(text, tone) {
-    var node = $("live");
-    node.textContent = text;
-    node.className = "muted " + (tone || "");
-  }
-
-  // The job in progress. A paused job that has lifted the tool is released
-  // (the machine is free to jog), so it is no longer the machine's active job
-  // but it is still the one in progress.
-  function jobInProgress() {
-    var m = model.machine;
-    if (m && m.active_job) {
-      return m.active_job;
-    }
-    for (var i = 0; i < model.jobs.length; i++) {
-      if (ACTIVE_STATES.indexOf(model.jobs[i].state) >= 0) {
-        return model.jobs[i];
-      }
-    }
-    return null;
-  }
-
-  // The tab says what the machine is doing, so a job can be watched from
-  // another tab or window.
-  function updateTitle() {
-    var m = model.machine;
-    var title = BASE_TITLE;
-    var job = jobInProgress();
-    if (m && m.alarm !== undefined && m.alarm !== null) {
-      title = "ALARM " + m.alarm + " - " + BASE_TITLE;
-    } else if (job) {
-      var percent = job.total_lines ? Math.floor((100 * job.acked_lines) / job.total_lines) : 0;
-      title = (job.state === "paused" ? "Paused " : "") + percent + "% " + job.name + " - " + BASE_TITLE;
-    }
-    document.title = title;
-  }
-
   // ---- Form values ------------------------------------------------------
 
-  // A number from an input, or undefined when the input is blank.
-  function number(input, label) {
-    var text = input.value.trim();
+  // A number from a form field, or undefined when the field is blank.
+  function number(text, label) {
+    text = text === null || text === undefined ? "" : String(text).trim();
     if (text === "") {
       return undefined;
     }
@@ -200,72 +113,17 @@
     return value;
   }
 
-  function requiredNumber(input, label) {
-    var value = number(input, label);
+  function requiredNumber(text, label) {
+    var value = number(text, label);
     if (value === undefined) {
       throw new Error(label + " is required");
     }
     return value;
   }
 
-  // Axis values for a work-zero or work-offset form, for the chosen system.
-  // Blank axes are left out.
-  function axisBody(prefix) {
-    var body = {};
-    var any = false;
-    AXIS_KEYS.forEach(function (key) {
-      var value = number($(prefix + key), key.toUpperCase());
-      if (value !== undefined) {
-        body[key] = value;
-        any = true;
-      }
-    });
-    if (!any) {
-      throw new Error("Enter at least one axis");
-    }
-    if ($("work-system").value) {
-      body.system = $("work-system").value;
-    }
-    return body;
+  function blankIfMissing(value) {
+    return value === null || value === undefined ? "" : String(value);
   }
-
-  function readBounds() {
-    var bounds = {};
-    AXIS_KEYS.forEach(function (key) {
-      var min = number($("b" + key + "-min"), key.toUpperCase() + " minimum");
-      var max = number($("b" + key + "-max"), key.toUpperCase() + " maximum");
-      if (min === undefined && max === undefined) {
-        return;
-      }
-      if (min === undefined || max === undefined) {
-        throw new Error(key.toUpperCase() + " needs both a minimum and a maximum, or neither");
-      }
-      bounds[key] = [min, max];
-    });
-    return bounds;
-  }
-
-  function resumeOptions() {
-    var body = {};
-    var z = number($("resume-z"), "Retract height");
-    if (z !== undefined) {
-      body.retract = { z: z };
-      var dwell = number($("resume-dwell"), "Spindle dwell");
-      if (dwell !== undefined) {
-        body.retract.dwell_s = dwell;
-      }
-    }
-    var line = number($("resume-line"), "From file line");
-    if (line !== undefined) {
-      body.from_line = Math.floor(line);
-    }
-    if ($("resume-accept-zero").checked) {
-      body.accept_moved_zero = true;
-    }
-    return body;
-  }
-
-  // ---- Machine ----------------------------------------------------------
 
   function formatAxes(values) {
     if (!values) {
@@ -274,345 +132,13 @@
     return values
       .slice(0, 3)
       .map(function (v, i) {
-        return AXES[i] + " " + v.toFixed(3);
+        return AXIS_NAMES[i] + " " + v.toFixed(3);
       })
       .join("   ");
   }
 
-  // Fills a row of the position readout, one cell per axis.
-  function setAxes(prefix, values) {
-    AXIS_KEYS.forEach(function (key, i) {
-      var cell = $(prefix + key);
-      cell.textContent = values && values[i] !== undefined ? values[i].toFixed(3) : "-";
-    });
-  }
-
-  // The zero of the active work system, in machine coordinates.
-  function activeZero() {
-    var m = model.machine || {};
-    if (m.work && m.work.offsets && m.work.offsets[m.work.system]) {
-      return m.work.offsets[m.work.system];
-    }
-    return (m.status && m.status.work_offset) || [0, 0, 0];
-  }
-
-  var systemsKey = "";
-
-  // The six work systems, with the active one marked. Rebuilt only when they
-  // change, so a button is not replaced under the pointer. While the
-  // controller is being asked again, `work` is briefly missing; the last
-  // values stay on screen rather than flicker away.
-  function renderSystems(work) {
-    if (!work) {
-      return;
-    }
-    var key = JSON.stringify(work);
-    if (key === systemsKey) {
-      return;
-    }
-    systemsKey = key;
-    var body = $("systems-body");
-    body.textContent = "";
-    Object.keys(work.offsets)
-      .sort()
-      .forEach(function (name) {
-        var zero = work.offsets[name];
-        var active = name === work.system;
-        body.appendChild(
-          h(
-            "tr",
-            { class: active ? "active" : "" },
-            h("th", { text: name }),
-            h("td", { text: zero[0].toFixed(3) }),
-            h("td", { text: zero[1].toFixed(3) }),
-            h("td", { text: zero[2].toFixed(3) }),
-            h(
-              "td",
-              {},
-              active
-                ? h("span", { text: "active" })
-                : h("button", { type: "button", "data-system": name, "data-needs": "move", text: "Use" })
-            )
-          )
-        );
-      });
-  }
-
-  // The sender asks when the controller disagrees with where it last saw the
-  // tool, and jobs may wait for the answer.
-  function renderPositionCheck(check) {
-    $("position-check").hidden = !check;
-    if (!check) {
-      return;
-    }
-    $("pc-question").textContent = check.question;
-    $("pc-detail").textContent =
-      "Recorded " + formatAxes(check.recorded) + ". The controller now reports " +
-      formatAxes(check.reported) + ". " +
-      (check.adjusted
-        ? "The work zeros were moved to keep the tool where the record puts it."
-        : "Jobs wait until you answer.");
-  }
-
-  function renderMachine(m) {
-    model.machine = m;
-    var status = m.status;
-
-    var label = "Disconnected";
-    var tone = "bad";
-    if (m.ready) {
-      label = "Connected";
-      tone = "ok";
-    } else if (m.connection === "connecting") {
-      label = "Connecting";
-      tone = "warn";
-    } else if (m.connection === "connected") {
-      label = "Identifying";
-      tone = "warn";
-    }
-    var pill = $("conn");
-    pill.textContent = label;
-    pill.className = "pill " + tone;
-
-    $("port").textContent = m.port || "";
-    var firmware = "";
-    if (m.firmware) {
-      firmware = (FIRMWARE_NAMES[m.firmware.kind] || m.firmware.kind) + " " + m.firmware.version;
-      if (m.rx_buffer_size) {
-        firmware += ", " + m.rx_buffer_size + " byte RX buffer";
-      }
-    }
-    $("firmware").textContent = firmware;
-
-    var chip = $("state");
-    chip.textContent = status ? status.state : "-";
-    chip.setAttribute("data-state", status ? status.state : "");
-    setAxes("dro-work-", status && status.work_position);
-    setAxes("dro-mach-", status && status.machine_position);
-    setAxes("dro-off-", status && status.work_offset);
-    if (m.work) {
-      $("sys-label").textContent = m.work.system;
-    }
-    $("feed").textContent =
-      status && status.feed_rate !== undefined && status.feed_rate !== null && status.feed_rate > 0
-        ? status.feed_rate + " mm/min"
-        : "";
-
-    setText(
-      "alarm",
-      m.alarm !== undefined && m.alarm !== null
-        ? "Alarm " + m.alarm + (m.alarm_message ? ": " + m.alarm_message : "") +
-          ". Clear it with Unlock or Home."
-        : ""
-    );
-    setText("last-error", m.last_error ? "Last error: " + m.last_error : "");
-    renderSystems(m.work);
-    renderPositionCheck(m.position_check);
-    updateTitle();
-    applyEnabled();
-    schedulePreview();
-  }
-
-  function handleMachine(m) {
-    var before = model.machine && model.machine.active_job;
-    var jobChanged = m.active_job ? upsertJob(m.active_job) : false;
-    if (m.active_job && !model.selected) {
-      model.selected = m.active_job.id;
-      jobChanged = true;
-    }
-    renderMachine(m);
-    if (jobChanged) {
-      renderJobs();
-      renderJobDetail();
-    }
-    if (before && !m.active_job) {
-      loadJobs().catch(notify);
-    }
-  }
-
-  // What the machine allows right now.
-  function abilities() {
-    var m = model.machine || {};
-    var state = (m.status && m.status.state) || "unknown";
-    var ready = !!m.ready;
-    var busy = !!m.active_job;
-    var controllable = ready && !busy;
-    return {
-      ready: ready,
-      busy: busy,
-      // Another job may not start while one is in progress, even a paused
-      // one that has freed the machine.
-      occupied: !!jobInProgress(),
-      state: state,
-      controllable: controllable,
-      canMove: controllable && (state === "Idle" || state === "Jog"),
-    };
-  }
-
-  // Why a control is unavailable, shown as its tooltip.
-  function reasonFor(need, a, job) {
-    if (need === "ready" || need === "move") {
-      if (!a.ready) {
-        return "Not connected to the controller yet";
-      }
-      if (a.busy) {
-        return "Unavailable while a job is active. Pause or stop it first";
-      }
-      return "The machine is in " + a.state + ", not idle";
-    }
-    if (!job) {
-      return "Select a job first";
-    }
-    var notReady = "Not connected to the controller yet";
-    switch (need) {
-      case "start":
-        if (!a.ready) {
-          return notReady;
-        }
-        return a.occupied ? "Another job is in progress" : "Only a loaded, completed or stopped job can start";
-      case "pause":
-      case "hold":
-        return job.state === "running" ? notReady : "Only a running job can be paused";
-      case "resume":
-        if (!a.ready) {
-          return notReady;
-        }
-        return a.occupied ? "Another job is in progress" : "Nothing to resume: the job is " + job.state;
-      case "stop":
-        return "Only a running or paused job can be stopped";
-      case "delete":
-        return "A job that is active cannot be deleted";
-      default:
-        return "";
-    }
-  }
-
-  // Enables each control whose `data-needs` the machine allows right now. The
-  // server still decides; this only keeps the page from offering what it would
-  // refuse, and says why.
-  function applyEnabled() {
-    var a = abilities();
-    var job = findJob(model.selected);
-    document.querySelectorAll("[data-needs]").forEach(function (node) {
-      var need = node.getAttribute("data-needs");
-      var allowed;
-      if (need === "ready") {
-        allowed = a.controllable;
-      } else if (need === "move") {
-        allowed = a.canMove;
-      } else {
-        allowed = jobAllowed(need, job, a.ready, a.occupied);
-      }
-      node.disabled = !allowed;
-      if (allowed) {
-        node.removeAttribute("title");
-      } else {
-        node.setAttribute("title", reasonFor(need, a, job));
-      }
-    });
-  }
-
-  // ---- Jogging ----------------------------------------------------------
-
-  function flash(button) {
-    button.classList.add("pressed");
-    setTimeout(function () {
-      button.classList.remove("pressed");
-    }, 160);
-  }
-
-  // Sends one jog of the chosen step (times `multiplier`) along an axis.
-  function sendJog(axis, sign, multiplier, button) {
-    return act(button, function () {
-      var step = Number($("jog-step").value) * multiplier;
-      var feed = Number($("jog-feed").value);
-      if (!(feed > 0)) {
-        throw new Error("Feed must be above zero");
-      }
-      var body = { feed: feed };
-      body[axis.toLowerCase()] = sign * step;
-      return request("POST", "/machine/jog", body);
-    });
-  }
-
-  function jogButton(axis, sign) {
-    return document.querySelector('button[data-axis="' + axis + '"][data-sign="' + sign + '"]');
-  }
-
-  function onKey(event) {
-    var target = event.target;
-    var tag = target && target.tagName;
-    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || (target && target.isContentEditable)) {
-      return;
-    }
-    if (event.ctrlKey || event.metaKey || event.altKey) {
-      return;
-    }
-    if (event.key === "Escape") {
-      if (abilities().controllable) {
-        act($("jog-cancel"), function () {
-          return request("POST", "/machine/jog/cancel");
-        });
-      }
-      return;
-    }
-    var jog = Lib.jogFromKey(event.key, event.shiftKey);
-    if (!jog) {
-      return;
-    }
-    // The arrow keys would scroll the page.
-    event.preventDefault();
-    if (event.repeat || !abilities().canMove) {
-      return;
-    }
-    var button = jogButton(jog.axis, jog.sign);
-    if (button) {
-      flash(button);
-    }
-    sendJog(jog.axis, jog.sign, jog.multiplier, null);
-  }
-
-  // ---- Jobs -------------------------------------------------------------
-
-  function findJob(id) {
-    for (var i = 0; i < model.jobs.length; i++) {
-      if (model.jobs[i].id === id) {
-        return model.jobs[i];
-      }
-    }
-    return null;
-  }
-
-  // Stores a job record. Returns whether it changed what is shown.
-  function upsertJob(job) {
-    for (var i = 0; i < model.jobs.length; i++) {
-      if (model.jobs[i].id === job.id) {
-        var changed = JSON.stringify(model.jobs[i]) !== JSON.stringify(job);
-        model.jobs[i] = job;
-        return changed;
-      }
-    }
-    model.jobs.push(job);
-    return true;
-  }
-
-  function storeJob(job) {
-    upsertJob(job);
-    renderAll();
-    // A short job can finish between two events, and the stream then never
-    // sends its final state. Ask the server what the job is now.
-    return loadJobs().catch(notify);
-  }
-
-  function removeJob(id) {
-    model.jobs = model.jobs.filter(function (job) {
-      return job.id !== id;
-    });
-    delete programs[id];
-    if (model.selected === id) {
-      model.selected = null;
-    }
-    renderAll();
+  function present(value) {
+    return value !== null && value !== undefined;
   }
 
   function jobAllowed(action, job, ready, occupied) {
@@ -637,611 +163,1197 @@
     }
   }
 
-  function renderJobs() {
-    var list = $("job-list");
-    list.textContent = "";
-    if (model.jobs.length === 0) {
-      list.appendChild(h("li", { class: "muted", text: "No programs yet. Upload one above." }));
-      return;
-    }
-    // Newest first.
-    model.jobs
-      .slice()
-      .reverse()
-      .forEach(function (job) {
-        list.appendChild(
-          h(
-            "li",
-            {},
-            h(
-              "button",
-              {
-                type: "button",
-                class: "job-row",
-                "data-job": job.id,
-                "aria-pressed": job.id === model.selected ? "true" : "false",
-              },
-              h("span", { class: "job-name", text: job.name }),
-              h("span", { class: "badge", "data-state": job.state, text: job.state }),
-              h("progress", { max: Math.max(job.total_lines, 1), value: job.acked_lines }),
-              h("span", { class: "muted", text: job.acked_lines + " / " + job.total_lines + " lines" })
-            )
-          )
-        );
-      });
-  }
+  // ---- Outside the component ---------------------------------------------
 
-  function renderJobTimes() {
-    var job = findJob(model.selected);
-    if (!job) {
-      return;
-    }
-    var now = Date.now();
-    var parts = [];
-    var elapsed = Lib.elapsedMs(job, now);
-    if (elapsed !== null) {
-      parts.push("Elapsed " + Lib.formatDuration(elapsed));
-    }
-    var left = Lib.remainingMs(job, now);
-    if (left !== null) {
-      parts.push("about " + Lib.formatDuration(left) + " left");
-    }
-    $("job-times").textContent = parts.join(", ");
-  }
-
-  function renderJobDetail() {
-    var job = findJob(model.selected);
-    $("job-detail").hidden = !job;
-    if (!job) {
-      return;
-    }
-
-    $("job-title").textContent = job.name;
-    var badge = $("job-state");
-    badge.textContent = job.state;
-    badge.setAttribute("data-state", job.state);
-
-    var progress = $("job-progress");
-    progress.max = Math.max(job.total_lines, 1);
-    progress.value = job.acked_lines;
-
-    var counts = job.acked_lines + " of " + job.total_lines + " lines acknowledged";
-    if (job.last_acked_line !== null && job.last_acked_line !== undefined) {
-      counts += ", last at file line " + job.last_acked_line;
-    }
-    $("job-counts").textContent = counts;
-    renderJobTimes();
-
-    setText("job-reason", job.reason);
-    $("job-reason").className = "reason" + (job.state === "failed" || job.state === "interrupted" ? " bad" : "");
-    $("job-hint").textContent = Lib.jobHint(job, model.machine);
-
-    var facts = $("job-facts");
-    facts.textContent = "";
-    if (job.paused_at) {
-      var lifted = job.paused_at.lifted_to;
-      facts.appendChild(
-        h("li", {
-          text:
-            "Paused at " + formatAxes(job.paused_at.position) +
-            (lifted !== null && lifted !== undefined
-              ? ", tool lifted to Z " + lifted
-              : ", tool not lifted"),
-        })
-      );
-    }
-    if (job.work_offsets && job.work_offsets.offsets) {
-      var ran = job.work_offsets.offsets[job.work_offsets.system];
-      facts.appendChild(
-        h("li", {
-          text: "Ran in " + job.work_offsets.system + (ran ? ", zero at " + formatAxes(ran) : ""),
-        })
-      );
-    }
-    if (job.resumed_from_line !== null && job.resumed_from_line !== undefined) {
-      facts.appendChild(h("li", { text: "Last resumed from file line " + job.resumed_from_line }));
-    }
-    job.line_errors.slice(-5).forEach(function (e) {
-      facts.appendChild(
-        h("li", {
-          class: "error-line",
-          text:
-            "Line " + e.line + ": error " + e.code +
-            (e.message ? " (" + e.message + ")" : "") + ", \"" + e.text + "\"",
-        })
-      );
-    });
-
-    loadProgram(job.id);
-    renderPreviewNote();
-    schedulePreview();
-    applyEnabled();
-  }
-
-  function renderAll() {
-    renderJobs();
-    renderJobDetail();
-    applyEnabled();
-  }
-
-  function loadJobs() {
-    return request("GET", "/jobs").then(function (jobs) {
-      model.jobs = jobs;
-      if (!findJob(model.selected)) {
-        model.selected = null;
-      }
-      if (!model.selected && model.machine && model.machine.active_job) {
-        model.selected = model.machine.active_job.id;
-      }
-      renderAll();
-    });
-  }
-
-  function runJobAction(button, action, id) {
-    var base = "/jobs/" + encodeURIComponent(id);
-    act(button, function () {
-      switch (action) {
-        case "start":
-          return request("POST", base + "/start").then(storeJob);
-        case "pause":
-          return request("POST", base + "/pause").then(storeJob);
-        case "hold":
-          return request("POST", base + "/pause", { lift: false }).then(storeJob);
-        case "resume":
-          return request("POST", base + "/resume", resumeOptions()).then(storeJob);
-        case "stop":
-          return request("POST", base + "/stop").then(storeJob);
-        case "delete":
-          if (!window.confirm("Delete this program and its record?")) {
-            return null;
-          }
-          return request("DELETE", base).then(function () {
-            removeJob(id);
-          });
-        default:
-          return null;
-      }
-    });
-  }
-
-  // ---- Toolpath preview -------------------------------------------------
-
+  // Parsed programs are kept out of Alpine's reactive state: a program can
+  // have hundreds of thousands of segments, and nothing needs to watch them.
+  // `programVersion` in the component changes when this does.
   var programs = {}; // job id -> {state: "loading" | "ready" | "error", parsed}
-  var previewQueued = false;
+  var preview = null; // the toolpath viewport (preview.js)
+  var noticeTimer = null;
+  var pressTimer = null;
+  var droppedFile = null; // a file dropped on the upload box
 
-  // Fetches and parses a job's program once.
-  function loadProgram(id) {
-    if (programs[id]) {
-      return;
-    }
-    programs[id] = { state: "loading" };
-    fetch("/jobs/" + encodeURIComponent(id) + "/program")
-      .then(function (res) {
-        if (!res.ok) {
-          throw new Error("HTTP " + res.status);
-        }
-        return res.text();
-      })
-      .then(function (text) {
-        programs[id] = { state: "ready", parsed: Lib.parseProgram(text) };
-      })
-      .catch(function () {
-        programs[id] = { state: "error" };
-      })
-      .then(function () {
-        renderPreviewNote();
-        schedulePreview();
-      });
-  }
-
-  function renderPreviewNote() {
-    var job = findJob(model.selected);
-    var note = $("preview-note");
-    var entry = job && programs[job.id];
-    if (!entry || entry.state !== "ready" || !entry.parsed.segments.length) {
-      note.textContent = "";
-      return;
-    }
-    var p = entry.parsed;
-    // The size of the part is where it cuts; rapids that travel to and from
-    // the work do not count. Programs that never cut are sized by all moves.
-    var lo = p.cutMin || p.min;
-    var hi = p.cutMax || p.max;
-    var size =
-      (hi[0] - lo[0]).toFixed(1) + " by " + (hi[1] - lo[1]).toFixed(1) +
-      " mm in XY, Z " + lo[2].toFixed(1) + " to " + hi[2].toFixed(1);
-    var parts = ["Preview, in work coordinates: " + (p.cutMin ? "it cuts " : "it moves ") + size + "."];
-    var outside = Lib.outsideBounds(p, model.bounds, activeZero());
-    if (outside.length) {
-      parts.push(
-        "It looks like this leaves the boundaries: " + outside.join("; ") +
-        ". The sender checks the real path when you start."
-      );
-    }
-    p.notes.forEach(function (n) {
-      parts.push(n + ".");
-    });
-    if (p.systems.length) {
-      parts.push("It selects " + p.systems.join(", ") + "; the preview draws it all in one frame.");
-    }
-    note.textContent = parts.join(" ");
-    $("preview").setAttribute("aria-label", "Toolpath preview, " + size);
-  }
-
-  function schedulePreview() {
-    if (previewQueued) {
-      return;
-    }
-    previewQueued = true;
-    window.requestAnimationFrame(function () {
-      previewQueued = false;
-      drawPreview();
-    });
-  }
-
-  function palette() {
-    var css = window.getComputedStyle(document.documentElement);
-    function color(name) {
-      return css.getPropertyValue(name).trim();
-    }
+  function sender() {
     return {
-      accent: color("--accent"),
-      line: color("--line"),
-      muted: color("--muted"),
-      warn: color("--warn"),
-      card: color("--card"),
-    };
-  }
+      // What the server last said.
+      machine: null,
+      work: null, // the last work systems seen; kept while they are re-read
+      jobs: [], // job records, oldest first
+      selected: null, // id of the job shown in the job panel
+      settings: null, // the last settings document the server sent
+      bounds: null, // the last boundaries the server sent
 
-  // Draws the program top-down: the path done so far in the accent colour, the
-  // rest in grey, rapids dotted, the boundaries dashed, and the tool itself.
-  function drawPreview() {
-    var job = findJob(model.selected);
-    var canvas = $("preview");
-    if (!job || $("job-detail").hidden) {
-      return;
-    }
-    var box = canvas.getBoundingClientRect();
-    if (box.width === 0) {
-      return;
-    }
-    var ratio = window.devicePixelRatio || 1;
-    var width = Math.round(box.width * ratio);
-    var height = Math.round(box.height * ratio);
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    var ctx = canvas.getContext("2d");
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.clearRect(0, 0, box.width, box.height);
-    var c = palette();
+      // The page.
+      live: "connecting",
+      notice: "",
+      busy: {}, // actions in flight, by name
+      now: Date.now(),
+      view: remembered("view", "machine"), // the section shown on a phone
+      setupTab: remembered("setup-tab", "zero"),
+      theme: THEMES.indexOf(remembered("theme", "auto")) >= 0 ? remembered("theme", "auto") : "auto",
+      programVersion: 0,
+      previewZoomed: false,
+      pressed: "", // the jog button lit by a key press
+      dropping: false,
+      fileName: "",
 
-    var entry = programs[job.id];
-    var p = entry && entry.state === "ready" ? entry.parsed : null;
-    if (!p || !p.segments.length) {
-      ctx.font = "13px system-ui, sans-serif";
-      ctx.fillStyle = c.muted;
-      ctx.textAlign = "center";
-      var message = !entry || entry.state === "loading" ? "Loading preview" : entry.state === "error"
-        ? "Preview unavailable"
-        : "No moves to draw";
-      ctx.fillText(message, box.width / 2, box.height / 2);
-      return;
-    }
+      // Forms.
+      axes: AXIS_NAMES.map(function (name, i) {
+        return { name: name, key: AXIS_KEYS[i], index: i };
+      }),
+      steps: STEPS,
+      jogStep: "1",
+      jogFeed: "1000",
+      zeroSystem: "",
+      zeroForm: { x: "", y: "", z: "" },
+      offsetForm: { x: "", y: "", z: "" },
+      resumeForm: { z: "", dwell: "", line: "", acceptZero: false },
+      settingsForm: { lift: true, height: "", z: "", dwell: "", trust: true },
+      boundsForm: { xmin: "", xmax: "", ymin: "", ymax: "", zmin: "", zmax: "" },
 
-    // Fit the path, and the tool if it is elsewhere.
-    var status = (model.machine && model.machine.status) || {};
-    var tool = status.work_position;
-    var lo = [p.min[0], p.min[1]];
-    var hi = [p.max[0], p.max[1]];
-    if (tool) {
-      lo = [Math.min(lo[0], tool[0]), Math.min(lo[1], tool[1])];
-      hi = [Math.max(hi[0], tool[0]), Math.max(hi[1], tool[1])];
-    }
-    var pad = 16;
-    var spanX = Math.max(hi[0] - lo[0], 1e-6);
-    var spanY = Math.max(hi[1] - lo[1], 1e-6);
-    var scale = Math.min((box.width - 2 * pad) / spanX, (box.height - 2 * pad) / spanY);
-    var offX = (box.width - spanX * scale) / 2;
-    var offY = (box.height - spanY * scale) / 2;
-    function sx(x) {
-      return offX + (x - lo[0]) * scale;
-    }
-    function sy(y) {
-      return box.height - offY - (y - lo[1]) * scale;
-    }
-
-    // The boundaries, in work coordinates.
-    var b = model.bounds;
-    if (b && b.x && b.y) {
-      var zero = activeZero();
-      ctx.save();
-      ctx.setLineDash([6, 4]);
-      ctx.strokeStyle = c.warn;
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(
-        sx(b.x[0] - zero[0]),
-        sy(b.y[1] - zero[1]),
-        (b.x[1] - b.x[0]) * scale,
-        (b.y[1] - b.y[0]) * scale
-      );
-      ctx.restore();
-    }
-
-    // The work origin.
-    ctx.strokeStyle = c.line;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(sx(0) - 6, sy(0));
-    ctx.lineTo(sx(0) + 6, sy(0));
-    ctx.moveTo(sx(0), sy(0) - 6);
-    ctx.lineTo(sx(0), sy(0) + 6);
-    ctx.stroke();
-
-    var done = job.last_acked_line === null || job.last_acked_line === undefined ? 0 : job.last_acked_line;
-    var rapid = [];
-    var pending = [];
-    var finished = [];
-    p.segments.forEach(function (s) {
-      (s.rapid ? rapid : s.line <= done ? finished : pending).push(s);
-    });
-    function stroke(segments, color, widthPx, dash) {
-      if (!segments.length) {
-        return;
-      }
-      ctx.save();
-      ctx.setLineDash(dash);
-      ctx.strokeStyle = color;
-      ctx.lineWidth = widthPx;
-      ctx.lineJoin = "round";
-      ctx.beginPath();
-      segments.forEach(function (s) {
-        ctx.moveTo(sx(s.a[0]), sy(s.a[1]));
-        ctx.lineTo(sx(s.b[0]), sy(s.b[1]));
-      });
-      ctx.stroke();
-      ctx.restore();
-    }
-    stroke(rapid, c.line, 1, [2, 3]);
-    stroke(pending, c.muted, 1.5, []);
-    stroke(finished, c.accent, 2, []);
-
-    if (tool) {
-      ctx.beginPath();
-      ctx.arc(sx(tool[0]), sy(tool[1]), 5, 0, 2 * Math.PI);
-      ctx.fillStyle = c.accent;
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = c.card;
-      ctx.stroke();
-    }
-  }
-
-  // ---- Settings and boundaries -----------------------------------------
-
-  function fillSettings(settings) {
-    model.settings = settings;
-    var pause = settings.pause;
-    $("set-lift").checked = pause.lift;
-    $("set-height").value = pause.height;
-    $("set-z").value = pause.z === null || pause.z === undefined ? "" : pause.z;
-    $("set-dwell").value = pause.dwell_s;
-    $("set-trust").checked = !settings.position || settings.position.trust_record !== false;
-  }
-
-  function fillBounds(bounds) {
-    model.bounds = bounds;
-    AXIS_KEYS.forEach(function (key) {
-      var range = bounds[key];
-      $("b" + key + "-min").value = range ? range[0] : "";
-      $("b" + key + "-max").value = range ? range[1] : "";
-    });
-    renderPreviewNote();
-    schedulePreview();
-  }
-
-  // ---- Event stream -----------------------------------------------------
-
-  function connectEvents() {
-    var events = new EventSource("/events");
-    events.onopen = function () {
-      setLive("Live", "ok");
-      // The stream starts with the current state. Refresh the program list
-      // too, in case another client changed it while the stream was down.
-      loadJobs().catch(notify);
-    };
-    events.onerror = function () {
-      setLive("Reconnecting", "warn");
-    };
-    events.addEventListener("machine", function (e) {
-      handleMachine(JSON.parse(e.data));
-    });
-    events.addEventListener("job", function (e) {
-      var job = JSON.parse(e.data);
-      if (upsertJob(job)) {
-        renderJobs();
-        renderJobDetail();
-      }
-      updateTitle();
-      applyEnabled();
-    });
-  }
-
-  // ---- Wiring -----------------------------------------------------------
-
-  function firstSubmit(form) {
-    return form.querySelector('button[type="submit"]');
-  }
-
-  function init() {
-    // What was chosen last time.
-    var step = remembered("jog-step", null);
-    if (step !== null && $("jog-step").querySelector('option[value="' + step + '"]')) {
-      $("jog-step").value = step;
-    }
-    var feed = Number(remembered("jog-feed", ""));
-    if (feed > 0) {
-      $("jog-feed").value = feed;
-    }
-    $("jog-step").addEventListener("change", function () {
-      remember("jog-step", $("jog-step").value);
-    });
-    $("jog-feed").addEventListener("change", function () {
-      remember("jog-feed", $("jog-feed").value);
-    });
-
-    document.querySelectorAll("[data-action]").forEach(function (button) {
-      button.addEventListener("click", function () {
-        var path = "/machine/" + button.getAttribute("data-action");
-        act(button, function () {
-          return request("POST", path);
-        });
-      });
-    });
-
-    document.querySelectorAll("[data-axis]").forEach(function (button) {
-      button.addEventListener("click", function (event) {
-        sendJog(
-          button.getAttribute("data-axis"),
-          Number(button.getAttribute("data-sign")),
-          event.shiftKey ? 10 : 1,
-          button
-        );
-      });
-    });
-    document.addEventListener("keydown", onKey);
-
-    $("jog-cancel").addEventListener("click", function () {
-      act($("jog-cancel"), function () {
-        return request("POST", "/machine/jog/cancel");
-      });
-    });
-
-    $("position-check").addEventListener("click", function (event) {
-      var button = event.target.closest("button[data-moved]");
-      if (!button) {
-        return;
-      }
-      act(button, function () {
-        return request("POST", "/machine/position-check", {
-          moved: button.getAttribute("data-moved") === "true",
-        });
-      });
-    });
-
-    $("systems-body").addEventListener("click", function (event) {
-      var button = event.target.closest("button[data-system]");
-      if (!button) {
-        return;
-      }
-      act(button, function () {
-        return request("PUT", "/machine/work-system", { system: button.getAttribute("data-system") });
-      });
-    });
-
-    $("zero-form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      act(firstSubmit(event.target), function () {
-        return request("POST", "/machine/work-zero", axisBody("zero-"));
-      });
-    });
-
-    $("offset-form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      act(firstSubmit(event.target), function () {
-        return request("PUT", "/machine/work-offset", axisBody("offset-"));
-      });
-    });
-
-    $("upload-form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      var input = $("file");
-      var file = input.files && input.files[0];
-      if (!file) {
-        notify(new Error("Choose a G-code file first"));
-        return;
-      }
-      act($("upload-button"), function () {
-        return readFile(file)
-          .then(function (text) {
-            return request("POST", "/jobs?name=" + encodeURIComponent(file.name), text);
-          })
-          .then(function (job) {
-            input.value = "";
-            model.selected = job.id;
-            return storeJob(job);
-          });
-      });
-    });
-
-    $("job-list").addEventListener("click", function (event) {
-      var row = event.target.closest("[data-job]");
-      if (!row) {
-        return;
-      }
-      model.selected = row.getAttribute("data-job");
-      renderAll();
-    });
-
-    $("job-detail").addEventListener("click", function (event) {
-      var button = event.target.closest("button[data-job-action]");
-      if (!button || !model.selected) {
-        return;
-      }
-      runJobAction(button, button.getAttribute("data-job-action"), model.selected);
-    });
-
-    $("settings-form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      act(firstSubmit(event.target), function () {
-        var pause = {
-          lift: $("set-lift").checked,
-          height: requiredNumber($("set-height"), "Lift height"),
-          dwell_s: requiredNumber($("set-dwell"), "Spindle dwell"),
-        };
-        var z = number($("set-z"), "Lift to Z");
-        if (z !== undefined) {
-          pause.z = z;
+      init: function () {
+        var self = this;
+        var step = remembered("jog-step", null);
+        if (STEPS.indexOf(step) >= 0) {
+          this.jogStep = step;
         }
-        // The server replaces the whole document, so start from what it sent
-        // and change only what this form shows.
-        var next = JSON.parse(JSON.stringify(model.settings || {}));
-        next.pause = pause;
-        next.position = { trust_record: $("set-trust").checked };
-        return request("PUT", "/settings", next).then(fillSettings);
-      });
-    });
+        var feed = Number(remembered("jog-feed", ""));
+        if (feed > 0) {
+          this.jogFeed = String(feed);
+        }
 
-    $("bounds-form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      act(firstSubmit(event.target), function () {
-        return request("PUT", "/machine/bounds", readBounds()).then(fillBounds);
-      });
-    });
-
-    $("bounds-clear").addEventListener("click", function () {
-      act($("bounds-clear"), function () {
-        return request("DELETE", "/machine/bounds").then(function () {
-          fillBounds({});
+        preview = window.SenderPreview.create(this.$refs.viewport, function (zoomed) {
+          self.previewZoomed = zoomed;
         });
-      });
-    });
+        this.drawGaugeTicks();
 
-    window.addEventListener("resize", schedulePreview);
-    try {
-      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", schedulePreview);
-    } catch (e) {
-      // Older browsers: the preview picks up a new scheme on its next redraw.
-    }
-    setInterval(renderJobTimes, 1000);
+        document.addEventListener("keydown", function (event) {
+          self.onKey(event);
+        });
+        window.addEventListener("resize", function () {
+          self.drawPreview();
+        });
+        try {
+          window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+            self.drawPreview();
+          });
+        } catch (e) {
+          // Older browsers: the preview picks up a new scheme on its next redraw.
+        }
+        setInterval(function () {
+          self.now = Date.now();
+        }, 1000);
 
-    request("GET", "/settings").then(fillSettings).catch(notify);
-    request("GET", "/machine/bounds").then(fillBounds).catch(notify);
-    request("GET", "/machine").then(handleMachine).catch(notify);
-    renderAll();
-    connectEvents();
+        // The tab says what the machine is doing, so a job can be watched from
+        // another tab or window.
+        window.Alpine.effect(function () {
+          document.title = self.pageTitle;
+        });
+
+        request("GET", "/settings").then(function (s) {
+          self.fillSettings(s);
+        }).catch(function (e) {
+          self.notify(e);
+        });
+        request("GET", "/machine/bounds").then(function (b) {
+          self.fillBounds(b);
+        }).catch(function (e) {
+          self.notify(e);
+        });
+        request("GET", "/machine").then(function (m) {
+          self.handleMachine(m);
+        }).catch(function (e) {
+          self.notify(e);
+        });
+        this.connectEvents();
+        this.drawPreview();
+      },
+
+      // ---- Feedback -----------------------------------------------------
+
+      notify: function (error) {
+        var self = this;
+        this.notice = error && error.message ? error.message : String(error);
+        clearTimeout(noticeTimer);
+        noticeTimer = setTimeout(function () {
+          self.notice = "";
+        }, 10000);
+      },
+
+      // Runs one user action. Its controls are disabled while it is in
+      // flight, and any error is shown in the notice.
+      act: function (name, action) {
+        var self = this;
+        this.busy[name] = true;
+        return Promise.resolve()
+          .then(action)
+          .catch(function (e) {
+            self.notify(e);
+          })
+          .then(function () {
+            self.busy[name] = false;
+          });
+      },
+
+      isBusy: function (name) {
+        return !!this.busy[name];
+      },
+
+      // ---- Header -------------------------------------------------------
+
+      get status() {
+        return (this.machine && this.machine.status) || null;
+      },
+
+      get connText() {
+        var m = this.machine;
+        if (!m) {
+          return "Starting";
+        }
+        if (m.ready) {
+          return "Connected";
+        }
+        if (m.connection === "connecting") {
+          return "Connecting";
+        }
+        if (m.connection === "connected") {
+          return "Identifying";
+        }
+        return "Disconnected";
+      },
+
+      get connTone() {
+        var m = this.machine;
+        if (m && m.ready) {
+          return "ok";
+        }
+        return m && (m.connection === "connecting" || m.connection === "connected") ? "warn" : "bad";
+      },
+
+      get liveText() {
+        return { connecting: "Connecting to events", live: "Live", reconnecting: "Reconnecting" }[this.live];
+      },
+
+      get liveTone() {
+        return { connecting: "warn", live: "ok", reconnecting: "warn" }[this.live];
+      },
+
+      get firmwareText() {
+        var m = this.machine;
+        if (!m || !m.firmware) {
+          return "No controller identified";
+        }
+        var text = (FIRMWARE_NAMES[m.firmware.kind] || m.firmware.kind) + " " + m.firmware.version;
+        if (m.rx_buffer_size) {
+          text += ", " + m.rx_buffer_size + " byte RX buffer";
+        }
+        return text;
+      },
+
+      get portText() {
+        return this.machine && this.machine.port ? " on " + this.machine.port : "";
+      },
+
+      get stateText() {
+        if (!this.machine || !this.machine.ready) {
+          return this.connText;
+        }
+        return this.status ? this.status.state : "-";
+      },
+
+      // The stack light: red for an alarm or no controller, amber when the
+      // machine waits on someone (a hold, a paused job, a question), green
+      // when it is fine.
+      get lamp() {
+        var m = this.machine;
+        if (!m || !m.ready || present(m.alarm)) {
+          return "red";
+        }
+        var state = this.status ? this.status.state : "";
+        if (state === "Alarm") {
+          return "red";
+        }
+        var job = this.jobInProgress();
+        if (m.position_check || (job && job.state === "paused") || ["Hold", "Door", "Check", "Sleep"].indexOf(state) >= 0) {
+          return "amber";
+        }
+        return "green";
+      },
+
+      get lampBlinks() {
+        var state = this.status ? this.status.state : "";
+        return state === "Run" || state === "Jog" || state === "Home";
+      },
+
+      cycleTheme: function () {
+        this.theme = THEMES[(THEMES.indexOf(this.theme) + 1) % THEMES.length];
+        remember("theme", this.theme);
+        applyTheme(this.theme);
+        this.drawPreview();
+      },
+
+      show: function (view) {
+        this.view = view;
+        remember("view", view);
+        this.drawPreview();
+      },
+
+      get dockPercent() {
+        var job = this.jobInProgress();
+        return job ? this.percentOf(job) + "%" : "";
+      },
+
+      get pageTitle() {
+        var m = this.machine;
+        var job = this.jobInProgress();
+        if (m && present(m.alarm)) {
+          return "ALARM " + m.alarm + " - " + BASE_TITLE;
+        }
+        if (job) {
+          return (job.state === "paused" ? "Paused " : "") + this.percentOf(job) + "% " + job.name + " - " + BASE_TITLE;
+        }
+        return BASE_TITLE;
+      },
+
+      // ---- Alerts -------------------------------------------------------
+
+      get alarmText() {
+        var m = this.machine;
+        if (!m || !present(m.alarm)) {
+          return "";
+        }
+        return m.alarm + (m.alarm_message ? ": " + m.alarm_message : "") + ". Clear it with Unlock or Home.";
+      },
+
+      get check() {
+        return (this.machine && this.machine.position_check) || null;
+      },
+
+      get checkDetail() {
+        var check = this.check;
+        if (!check) {
+          return "";
+        }
+        return (
+          "Recorded " + formatAxes(check.recorded) + ". The controller now reports " +
+          formatAxes(check.reported) + ". " +
+          (check.adjusted
+            ? "The work zeros were moved to keep the tool where the record puts it."
+            : "Jobs wait until you answer.")
+        );
+      },
+
+      answerCheck: function (moved) {
+        return this.act("check", function () {
+          return request("POST", "/machine/position-check", { moved: moved });
+        });
+      },
+
+      // ---- Position -----------------------------------------------------
+
+      // One axis of a position: "work", "machine" or "offset" (the zero).
+      axisValues: function (kind) {
+        var s = this.status;
+        if (!s) {
+          return null;
+        }
+        return kind === "work" ? s.work_position : kind === "machine" ? s.machine_position : s.work_offset;
+      },
+
+      axisValue: function (kind, i) {
+        var values = this.axisValues(kind);
+        return values && present(values[i]) ? values[i].toFixed(3) : "-";
+      },
+
+      // The work position for the seven-segment readout: right-aligned under
+      // its unlit "88888.888", with "!" (all segments off) as padding.
+      digits: function (kind, i) {
+        var values = this.axisValues(kind);
+        if (!values || !present(values[i])) {
+          return "!!!!-.---";
+        }
+        var text = values[i].toFixed(3);
+        if (text.length > 9) {
+          return text.slice(0, 9);
+        }
+        return "!!!!!!!!!".slice(0, 9 - text.length) + text;
+      },
+
+      get feedText() {
+        var s = this.status;
+        return s && present(s.feed_rate) ? s.feed_rate + " mm/min" : "-";
+      },
+
+      get spindleText() {
+        var s = this.status;
+        return s && present(s.spindle_speed) ? s.spindle_speed + " rpm" : "-";
+      },
+
+      get lastErrorText() {
+        return this.machine && this.machine.last_error ? "Last error: " + this.machine.last_error : "";
+      },
+
+      machineAction: function (action) {
+        return this.act(action, function () {
+          return request("POST", "/machine/" + action);
+        });
+      },
+
+      handleMachine: function (m) {
+        var before = this.machine && this.machine.active_job;
+        if (m.active_job) {
+          this.upsertJob(m.active_job);
+          if (!this.selected) {
+            this.selected = m.active_job.id;
+          }
+        }
+        this.machine = m;
+        if (m.work) {
+          // While the controller is being asked again, `work` is briefly
+          // missing; the last values stay on screen rather than flicker away.
+          this.work = m.work;
+        }
+        if (before && !m.active_job) {
+          this.loadJobs();
+        }
+        this.drawPreview();
+      },
+
+      // ---- What the machine allows ------------------------------------
+
+      // The job in progress. A paused job that has lifted the tool is
+      // released (the machine is free to jog), so it is no longer the
+      // machine's active job but it is still the one in progress.
+      jobInProgress: function () {
+        var m = this.machine;
+        if (m && m.active_job) {
+          return m.active_job;
+        }
+        for (var i = 0; i < this.jobs.length; i++) {
+          if (ACTIVE_STATES.indexOf(this.jobs[i].state) >= 0) {
+            return this.jobs[i];
+          }
+        }
+        return null;
+      },
+
+      abilities: function () {
+        var m = this.machine || {};
+        var state = (m.status && m.status.state) || "unknown";
+        var ready = !!m.ready;
+        var busy = !!m.active_job;
+        var controllable = ready && !busy;
+        return {
+          ready: ready,
+          busy: busy,
+          // Another job may not start while one is in progress, even a
+          // paused one that has freed the machine.
+          occupied: !!this.jobInProgress(),
+          state: state,
+          controllable: controllable,
+          canMove: controllable && (state === "Idle" || state === "Jog"),
+        };
+      },
+
+      // Whether the machine allows what a control needs: "ready" (idle
+      // controller, no job), "move" (and not moving), or a job action. The
+      // server still decides; this only keeps the page from offering what it
+      // would refuse.
+      allowed: function (need) {
+        var a = this.abilities();
+        if (need === "ready") {
+          return a.controllable;
+        }
+        if (need === "move") {
+          return a.canMove;
+        }
+        return jobAllowed(need, this.job, a.ready, a.occupied);
+      },
+
+      // Whether a control is off: not allowed, or its action is in flight.
+      off: function (need, action) {
+        return !!(action && this.busy[action]) || !this.allowed(need);
+      },
+
+      // Why a control is unavailable, shown as its tooltip.
+      why: function (need) {
+        if (this.allowed(need)) {
+          return "";
+        }
+        var a = this.abilities();
+        var job = this.job;
+        var notReady = "Not connected to the controller yet";
+        if (need === "ready" || need === "move") {
+          if (!a.ready) {
+            return notReady;
+          }
+          if (a.busy) {
+            return "Unavailable while a job is active. Pause or stop it first";
+          }
+          return "The machine is in " + a.state + ", not idle";
+        }
+        if (!job) {
+          return "Select a job first";
+        }
+        switch (need) {
+          case "start":
+            if (!a.ready) {
+              return notReady;
+            }
+            return a.occupied ? "Another job is in progress" : "Only a loaded, completed or stopped job can start";
+          case "pause":
+          case "hold":
+            return job.state === "running" ? notReady : "Only a running job can be paused";
+          case "resume":
+            if (!a.ready) {
+              return notReady;
+            }
+            return a.occupied ? "Another job is in progress" : "Nothing to resume: the job is " + job.state;
+          case "stop":
+            return "Only a running or paused job can be stopped";
+          case "delete":
+            return "A job that is active cannot be deleted";
+          default:
+            return "";
+        }
+      },
+
+      // ---- Jogging ------------------------------------------------------
+
+      rememberJog: function () {
+        remember("jog-step", this.jogStep);
+        remember("jog-feed", this.jogFeed);
+      },
+
+      // Sends one jog of the chosen step (times `multiplier`) along an axis.
+      sendJog: function (axis, sign, multiplier) {
+        var self = this;
+        return this.act("jog", function () {
+          var step = Number(self.jogStep) * multiplier;
+          var feed = Number(self.jogFeed);
+          if (!(feed > 0)) {
+            throw new Error("Feed must be above zero");
+          }
+          var body = { feed: feed };
+          body[axis.toLowerCase()] = sign * step;
+          return request("POST", "/machine/jog", body);
+        });
+      },
+
+      jogClick: function (axis, sign, event) {
+        this.sendJog(axis, sign, event && event.shiftKey ? 10 : 1);
+      },
+
+      cancelJog: function () {
+        return this.act("cancel", function () {
+          return request("POST", "/machine/jog/cancel");
+        });
+      },
+
+      // A key press lights its button, so the jog is seen to have been sent.
+      flash: function (name) {
+        var self = this;
+        this.pressed = name;
+        clearTimeout(pressTimer);
+        pressTimer = setTimeout(function () {
+          self.pressed = "";
+        }, 160);
+      },
+
+      onKey: function (event) {
+        var target = event.target;
+        var tag = target && target.tagName;
+        if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || (target && target.isContentEditable)) {
+          return;
+        }
+        if (event.ctrlKey || event.metaKey || event.altKey) {
+          return;
+        }
+        if (event.key === "Escape") {
+          if (this.abilities().controllable) {
+            this.cancelJog();
+          }
+          return;
+        }
+        var jog = Lib.jogFromKey(event.key, event.shiftKey);
+        if (!jog) {
+          return;
+        }
+        // The arrow keys would scroll the page.
+        event.preventDefault();
+        if (event.repeat || !this.abilities().canMove) {
+          return;
+        }
+        this.flash(jog.axis + jog.sign);
+        this.sendJog(jog.axis, jog.sign, jog.multiplier);
+      },
+
+      // ---- Work systems ---------------------------------------------------
+
+      // The six work systems, with the active one marked.
+      get systems() {
+        var work = this.work;
+        if (!work) {
+          return [];
+        }
+        return Object.keys(work.offsets)
+          .sort()
+          .map(function (name) {
+            var zero = work.offsets[name];
+            return {
+              name: name,
+              active: name === work.system,
+              x: zero[0].toFixed(3),
+              y: zero[1].toFixed(3),
+              z: zero[2].toFixed(3),
+            };
+          });
+      },
+
+      // The zero of the active work system, in machine coordinates.
+      activeZero: function () {
+        var m = this.machine || {};
+        var work = this.work;
+        if (work && work.offsets && work.offsets[work.system]) {
+          return work.offsets[work.system];
+        }
+        return (m.status && m.status.work_offset) || [0, 0, 0];
+      },
+
+      useSystem: function (name) {
+        return this.act("system", function () {
+          return request("PUT", "/machine/work-system", { system: name });
+        });
+      },
+
+      // Axis values for a work-zero or work-offset form, for the chosen
+      // system. Blank axes are left out.
+      axisBody: function (form) {
+        var body = {};
+        var any = false;
+        AXIS_KEYS.forEach(function (key) {
+          var value = number(form[key], key.toUpperCase());
+          if (value !== undefined) {
+            body[key] = value;
+            any = true;
+          }
+        });
+        if (!any) {
+          throw new Error("Enter at least one axis");
+        }
+        if (this.zeroSystem) {
+          body.system = this.zeroSystem;
+        }
+        return body;
+      },
+
+      setZero: function () {
+        var self = this;
+        return this.act("zero", function () {
+          return request("POST", "/machine/work-zero", self.axisBody(self.zeroForm));
+        });
+      },
+
+      setOffset: function () {
+        var self = this;
+        return this.act("offset", function () {
+          return request("PUT", "/machine/work-offset", self.axisBody(self.offsetForm));
+        });
+      },
+
+      // ---- Jobs -----------------------------------------------------------
+
+      get job() {
+        return this.findJob(this.selected);
+      },
+
+      get jobsNewestFirst() {
+        return this.jobs.slice().reverse();
+      },
+
+      findJob: function (id) {
+        for (var i = 0; i < this.jobs.length; i++) {
+          if (this.jobs[i].id === id) {
+            return this.jobs[i];
+          }
+        }
+        return null;
+      },
+
+      // Stores a job record, replacing it only when it changed.
+      upsertJob: function (job) {
+        for (var i = 0; i < this.jobs.length; i++) {
+          if (this.jobs[i].id === job.id) {
+            if (JSON.stringify(this.jobs[i]) !== JSON.stringify(job)) {
+              this.jobs[i] = job;
+            }
+            return;
+          }
+        }
+        this.jobs.push(job);
+      },
+
+      storeJob: function (job) {
+        this.upsertJob(job);
+        this.drawPreview();
+        // A short job can finish between two events, and the stream then
+        // never sends its final state. Ask the server what the job is now.
+        return this.loadJobs();
+      },
+
+      removeJob: function (id) {
+        this.jobs = this.jobs.filter(function (job) {
+          return job.id !== id;
+        });
+        delete programs[id];
+        if (this.selected === id) {
+          this.selected = null;
+        }
+        this.drawPreview();
+      },
+
+      loadJobs: function () {
+        var self = this;
+        return request("GET", "/jobs")
+          .then(function (jobs) {
+            self.jobs = jobs;
+            if (!self.findJob(self.selected)) {
+              self.selected = null;
+            }
+            if (!self.selected && self.machine && self.machine.active_job) {
+              self.selected = self.machine.active_job.id;
+            }
+            // With nothing chosen, show the job in progress or else the
+            // newest program.
+            if (!self.selected && jobs.length) {
+              var current = self.jobInProgress();
+              self.selected = current ? current.id : jobs[jobs.length - 1].id;
+            }
+            self.drawPreview();
+          })
+          .catch(function (e) {
+            self.notify(e);
+          });
+      },
+
+      select: function (id) {
+        this.selected = id;
+        this.drawPreview();
+      },
+
+      percentOf: function (job) {
+        return job.total_lines ? Math.floor((100 * job.acked_lines) / job.total_lines) : 0;
+      },
+
+      rowPercent: function (job) {
+        return (job.total_lines ? (100 * job.acked_lines) / job.total_lines : 0) + "%";
+      },
+
+      get percentWidth() {
+        return this.job ? this.rowPercent(this.job) : "0%";
+      },
+
+      get percentText() {
+        return this.job ? this.percentOf(this.job) + "%" : "";
+      },
+
+      get percentDigits() {
+        return this.job ? String(this.percentOf(this.job)) : "";
+      },
+
+      get linesText() {
+        var job = this.job;
+        return job ? job.acked_lines + " / " + job.total_lines : "";
+      },
+
+      get fileLineText() {
+        var job = this.job;
+        return job && present(job.last_acked_line) ? String(job.last_acked_line) : "-";
+      },
+
+      get elapsedText() {
+        var job = this.job;
+        var elapsed = job ? Lib.elapsedMs(job, this.now) : null;
+        return elapsed === null ? "-" : Lib.formatDuration(elapsed);
+      },
+
+      get remainingText() {
+        var job = this.job;
+        var left = job ? Lib.remainingMs(job, this.now) : null;
+        return left === null ? "-" : "about " + Lib.formatDuration(left);
+      },
+
+      get hintText() {
+        return this.job ? Lib.jobHint(this.job, this.machine) : "";
+      },
+
+      get reasonIsBad() {
+        var job = this.job;
+        return !!job && (job.state === "failed" || job.state === "interrupted");
+      },
+
+      // What happened to the selected job, one line each.
+      get facts() {
+        var job = this.job;
+        var facts = [];
+        if (!job) {
+          return facts;
+        }
+        if (job.paused_at) {
+          var lifted = job.paused_at.lifted_to;
+          facts.push({
+            key: "paused",
+            text:
+              "Paused at " + formatAxes(job.paused_at.position) +
+              (present(lifted) ? ", tool lifted to Z " + lifted : ", tool not lifted"),
+          });
+        }
+        if (job.work_offsets && job.work_offsets.offsets) {
+          var ran = job.work_offsets.offsets[job.work_offsets.system];
+          facts.push({
+            key: "ran",
+            text: "Ran in " + job.work_offsets.system + (ran ? ", zero at " + formatAxes(ran) : ""),
+          });
+        }
+        if (present(job.resumed_from_line)) {
+          facts.push({ key: "resumed", text: "Last resumed from file line " + job.resumed_from_line });
+        }
+        job.line_errors.slice(-5).forEach(function (e, i) {
+          facts.push({
+            key: "error" + i,
+            bad: true,
+            text:
+              "Line " + e.line + ": error " + e.code +
+              (e.message ? " (" + e.message + ")" : "") + ", \"" + e.text + "\"",
+          });
+        });
+        return facts;
+      },
+
+      resumeOptions: function () {
+        var form = this.resumeForm;
+        var body = {};
+        var z = number(form.z, "Retract height");
+        if (z !== undefined) {
+          body.retract = { z: z };
+          var dwell = number(form.dwell, "Spindle dwell");
+          if (dwell !== undefined) {
+            body.retract.dwell_s = dwell;
+          }
+        }
+        var line = number(form.line, "From file line");
+        if (line !== undefined) {
+          body.from_line = Math.floor(line);
+        }
+        if (form.acceptZero) {
+          body.accept_moved_zero = true;
+        }
+        return body;
+      },
+
+      jobAction: function (action) {
+        var self = this;
+        var id = this.selected;
+        if (!id) {
+          return null;
+        }
+        var base = "/jobs/" + encodeURIComponent(id);
+        function store(job) {
+          return self.storeJob(job);
+        }
+        return this.act(action, function () {
+          switch (action) {
+            case "start":
+              return request("POST", base + "/start").then(store);
+            case "pause":
+              return request("POST", base + "/pause").then(store);
+            case "hold":
+              return request("POST", base + "/pause", { lift: false }).then(store);
+            case "resume":
+              return request("POST", base + "/resume", self.resumeOptions()).then(store);
+            case "stop":
+              return request("POST", base + "/stop").then(store);
+            case "delete":
+              if (!window.confirm("Delete this program and its record?")) {
+                return null;
+              }
+              return request("DELETE", base).then(function () {
+                self.removeJob(id);
+              });
+            default:
+              return null;
+          }
+        });
+      },
+
+      // ---- Upload -------------------------------------------------------
+
+      chosenFile: function () {
+        var input = this.$refs.file;
+        return (input.files && input.files[0]) || droppedFile;
+      },
+
+      fileChosen: function () {
+        droppedFile = null;
+        var file = this.chosenFile();
+        this.fileName = file ? file.name : "";
+      },
+
+      dragOver: function () {
+        this.dropping = true;
+      },
+
+      dragLeave: function () {
+        this.dropping = false;
+      },
+
+      dropFile: function (event) {
+        this.dropping = false;
+        var files = event.dataTransfer && event.dataTransfer.files;
+        if (!files || !files.length) {
+          return;
+        }
+        this.$refs.file.value = "";
+        droppedFile = files[0];
+        this.fileName = droppedFile.name;
+      },
+
+      upload: function () {
+        var self = this;
+        var file = this.chosenFile();
+        if (!file) {
+          this.notify(new Error("Choose a G-code file first"));
+          return null;
+        }
+        return this.act("upload", function () {
+          return readFile(file)
+            .then(function (text) {
+              return request("POST", "/jobs?name=" + encodeURIComponent(file.name), text);
+            })
+            .then(function (job) {
+              self.$refs.file.value = "";
+              droppedFile = null;
+              self.fileName = "";
+              self.selected = job.id;
+              return self.storeJob(job);
+            });
+        });
+      },
+
+      // ---- Progress gauge -------------------------------------------------
+
+      // The dial's scale marks, drawn once with d3.
+      drawGaugeTicks: function () {
+        var ticks = d3.range(0, 101, 5);
+        d3.select(this.$refs.gaugeTicks)
+          .selectAll("line")
+          .data(ticks)
+          .join("line")
+          .attr("class", function (t) {
+            return t % 25 === 0 ? "major" : "minor";
+          })
+          .attr("x1", function (t) {
+            return Math.sin(GAUGE_START + (GAUGE_SWEEP * t) / 100) * 55;
+          })
+          .attr("y1", function (t) {
+            return -Math.cos(GAUGE_START + (GAUGE_SWEEP * t) / 100) * 55;
+          })
+          .attr("x2", function (t) {
+            return Math.sin(GAUGE_START + (GAUGE_SWEEP * t) / 100) * (t % 25 === 0 ? 47 : 51);
+          })
+          .attr("y2", function (t) {
+            return -Math.cos(GAUGE_START + (GAUGE_SWEEP * t) / 100) * (t % 25 === 0 ? 47 : 51);
+          });
+      },
+
+      gaugeArc: function (fraction) {
+        return d3.arc()({
+          innerRadius: 37,
+          outerRadius: 44,
+          startAngle: GAUGE_START,
+          endAngle: GAUGE_START + GAUGE_SWEEP * Math.max(0, Math.min(1, fraction)),
+          cornerRadius: 1,
+        });
+      },
+
+      get gaugeTrack() {
+        return this.gaugeArc(1);
+      },
+
+      get gaugeFill() {
+        var job = this.job;
+        return this.gaugeArc(job && job.total_lines ? job.acked_lines / job.total_lines : 0);
+      },
+
+      // ---- Toolpath preview ---------------------------------------------
+
+      // Fetches and parses a job's program once.
+      loadProgram: function (id) {
+        var self = this;
+        if (programs[id]) {
+          return;
+        }
+        programs[id] = { state: "loading" };
+        fetch("/jobs/" + encodeURIComponent(id) + "/program")
+          .then(function (res) {
+            if (!res.ok) {
+              throw new Error("HTTP " + res.status);
+            }
+            return res.text();
+          })
+          .then(function (text) {
+            programs[id] = { state: "ready", parsed: Lib.parseProgram(text) };
+          })
+          .catch(function () {
+            programs[id] = { state: "error" };
+          })
+          .then(function () {
+            self.programVersion++;
+            self.drawPreview();
+          });
+      },
+
+      // The selected job's parsed program, if it is ready.
+      program: function () {
+        var job = this.job;
+        var entry = job && programs[job.id];
+        // Read so the getters that use this follow the programs.
+        return this.programVersion >= 0 && entry && entry.state === "ready" ? entry.parsed : null;
+      },
+
+      get previewReady() {
+        var p = this.program();
+        return !!p && p.segments.length > 0;
+      },
+
+      get previewMessage() {
+        var job = this.job;
+        if (!job) {
+          return this.jobs.length ? "Select a program to see its toolpath" : "Upload a program to see its toolpath";
+        }
+        var entry = this.programVersion >= 0 && programs[job.id];
+        if (!entry || entry.state === "loading") {
+          return "Loading preview";
+        }
+        if (entry.state === "error") {
+          return "Preview unavailable";
+        }
+        return entry.parsed.segments.length ? "" : "No moves to draw";
+      },
+
+      // The size of the part: where it cuts. Rapids that travel to and from
+      // the work do not count. Programs that never cut are sized by all moves.
+      get previewSize() {
+        var p = this.program();
+        if (!p || !p.segments.length) {
+          return "";
+        }
+        var lo = p.cutMin || p.min;
+        var hi = p.cutMax || p.max;
+        return (
+          (hi[0] - lo[0]).toFixed(1) + " by " + (hi[1] - lo[1]).toFixed(1) +
+          " mm in XY, Z " + lo[2].toFixed(1) + " to " + hi[2].toFixed(1)
+        );
+      },
+
+      get previewLabel() {
+        return this.previewSize ? "Toolpath preview, " + this.previewSize : "Toolpath preview";
+      },
+
+      get outside() {
+        return Lib.outsideBounds(this.program(), this.bounds, this.activeZero());
+      },
+
+      get previewWarns() {
+        return this.outside.length > 0;
+      },
+
+      get previewNote() {
+        var p = this.program();
+        if (!p || !p.segments.length) {
+          return "";
+        }
+        var parts = ["Work coordinates: " + (p.cutMin ? "it cuts " : "it moves ") + this.previewSize + "."];
+        var outside = this.outside;
+        if (outside.length) {
+          parts.push(
+            "It looks like this leaves the boundaries: " + outside.join("; ") +
+            ". The sender checks the real path when you start."
+          );
+        }
+        p.notes.forEach(function (n) {
+          parts.push(n + ".");
+        });
+        if (p.systems.length) {
+          parts.push("It selects " + p.systems.join(", ") + "; the preview draws it all in one frame.");
+        }
+        return parts.join(" ");
+      },
+
+      palette: function () {
+        var css = window.getComputedStyle(document.documentElement);
+        function color(name) {
+          return css.getPropertyValue(name).trim();
+        }
+        return {
+          bg: color("--view-bg"),
+          grid: color("--view-grid"),
+          gridMinor: color("--view-grid-minor"),
+          done: color("--path-done"),
+          pending: color("--path-pending"),
+          rapid: color("--path-rapid"),
+          tool: color("--path-tool"),
+          hazard: color("--hazard"),
+          hazardDark: color("--hazard-dark"),
+          axisX: color("--axis-x"),
+          axisY: color("--axis-y"),
+          text: color("--view-text"),
+        };
+      },
+
+      // Draws the selected program: the path done so far, the rest, rapids,
+      // the boundaries in work coordinates, and the tool.
+      drawPreview: function () {
+        if (!preview) {
+          return;
+        }
+        var job = this.job;
+        if (job) {
+          this.loadProgram(job.id);
+        }
+        var b = this.bounds;
+        var zero = this.activeZero();
+        var status = this.status || {};
+        preview.draw({
+          key: job ? job.id : null,
+          parsed: this.program(),
+          done: job && present(job.last_acked_line) ? job.last_acked_line : 0,
+          tool: status.work_position ? [status.work_position[0], status.work_position[1]] : null,
+          bounds:
+            b && b.x && b.y
+              ? { x: [b.x[0] - zero[0], b.x[1] - zero[0]], y: [b.y[0] - zero[1], b.y[1] - zero[1]] }
+              : null,
+          palette: this.palette(),
+        });
+      },
+
+      zoomPreview: function (factor) {
+        preview.zoomBy(factor);
+      },
+
+      fitPreview: function () {
+        preview.fit();
+      },
+
+      // ---- Settings and boundaries --------------------------------------
+
+      fillSettings: function (settings) {
+        this.settings = settings;
+        var pause = settings.pause;
+        this.settingsForm.lift = !!pause.lift;
+        this.settingsForm.height = blankIfMissing(pause.height);
+        this.settingsForm.z = blankIfMissing(pause.z);
+        this.settingsForm.dwell = blankIfMissing(pause.dwell_s);
+        this.settingsForm.trust = !settings.position || settings.position.trust_record !== false;
+      },
+
+      saveSettings: function () {
+        var self = this;
+        return this.act("settings", function () {
+          var form = self.settingsForm;
+          var pause = {
+            lift: !!form.lift,
+            height: requiredNumber(form.height, "Lift height"),
+            dwell_s: requiredNumber(form.dwell, "Spindle dwell"),
+          };
+          var z = number(form.z, "Lift to Z");
+          if (z !== undefined) {
+            pause.z = z;
+          }
+          // The server replaces the whole document, so start from what it
+          // sent and change only what this form shows.
+          var next = JSON.parse(JSON.stringify(self.settings || {}));
+          next.pause = pause;
+          next.position = { trust_record: !!form.trust };
+          return request("PUT", "/settings", next).then(function (s) {
+            self.fillSettings(s);
+          });
+        });
+      },
+
+      fillBounds: function (bounds) {
+        var self = this;
+        this.bounds = bounds;
+        AXIS_KEYS.forEach(function (key) {
+          var range = bounds[key];
+          self.boundsForm[key + "min"] = range ? String(range[0]) : "";
+          self.boundsForm[key + "max"] = range ? String(range[1]) : "";
+        });
+        this.drawPreview();
+      },
+
+      readBounds: function () {
+        var form = this.boundsForm;
+        var bounds = {};
+        AXIS_KEYS.forEach(function (key) {
+          var min = number(form[key + "min"], key.toUpperCase() + " minimum");
+          var max = number(form[key + "max"], key.toUpperCase() + " maximum");
+          if (min === undefined && max === undefined) {
+            return;
+          }
+          if (min === undefined || max === undefined) {
+            throw new Error(key.toUpperCase() + " needs both a minimum and a maximum, or neither");
+          }
+          bounds[key] = [min, max];
+        });
+        return bounds;
+      },
+
+      saveBounds: function () {
+        var self = this;
+        return this.act("bounds", function () {
+          return request("PUT", "/machine/bounds", self.readBounds()).then(function (b) {
+            self.fillBounds(b);
+          });
+        });
+      },
+
+      clearBounds: function () {
+        var self = this;
+        return this.act("boundsClear", function () {
+          return request("DELETE", "/machine/bounds").then(function () {
+            self.fillBounds({});
+          });
+        });
+      },
+
+      // ---- Event stream -------------------------------------------------
+
+      connectEvents: function () {
+        var self = this;
+        var events = new EventSource("/events");
+        events.onopen = function () {
+          self.live = "live";
+          // The stream starts with the current state. Refresh the program
+          // list too, in case another client changed it while it was down.
+          self.loadJobs();
+        };
+        events.onerror = function () {
+          self.live = "reconnecting";
+        };
+        events.addEventListener("machine", function (e) {
+          self.handleMachine(JSON.parse(e.data));
+        });
+        events.addEventListener("job", function (e) {
+          self.upsertJob(JSON.parse(e.data));
+          self.drawPreview();
+        });
+      },
+    };
   }
 
-  init();
+  document.addEventListener("alpine:init", function () {
+    window.Alpine.data("sender", sender);
+  });
 })();
