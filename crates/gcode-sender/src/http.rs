@@ -3,12 +3,14 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -35,6 +37,7 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(crate::web::routes())
         .route("/health", get(health))
         .route("/events", get(events))
         .route("/machine", get(machine))
@@ -54,12 +57,61 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job).delete(delete_job))
+        .route("/jobs/{id}/program", get(get_program))
         .route("/jobs/{id}/start", post(start_job))
         .route("/jobs/{id}/pause", post(pause_job))
         .route("/jobs/{id}/resume", post(resume_job))
         .route("/jobs/{id}/stop", post(stop_job))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(middleware::from_fn(local_only))
         .with_state(state)
+}
+
+/// Serves only requests that came from this machine's own pages. The sender
+/// drives a machine, so a web page open in the same browser must not be able
+/// to reach it. The `Host` header has to name a loopback address, which stops
+/// DNS rebinding from making a remote site look local. When a browser sends an
+/// `Origin`, it has to be a loopback page too, so another site cannot send a
+/// jog through the visitor's browser.
+async fn local_only(req: Request, next: Next) -> Response {
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_loopback_authority);
+    let origin_ok = match req.headers().get(header::ORIGIN) {
+        None => true,
+        Some(origin) => origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.strip_prefix("http://"))
+            .is_some_and(is_loopback_authority),
+    };
+    if host_ok && origin_ok {
+        next.run(req).await
+    } else {
+        ApiError(
+            StatusCode::FORBIDDEN,
+            "this sender only serves requests from the machine it runs on".into(),
+        )
+        .into_response()
+    }
+}
+
+/// Whether an authority (`host`, or `host:port`, with IPv6 in brackets) names
+/// this machine: `localhost` or a loopback address.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((ip, _)) => ip,
+            None => return false,
+        },
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 pub struct ApiError(StatusCode, String);
@@ -159,6 +211,20 @@ async fn get_job(
 ) -> ApiResult<Json<JobRecord>> {
     let record = app.store.get(&id)?.ok_or_else(not_found)?;
     Ok(Json(freshest(&app, record)))
+}
+
+/// The program as uploaded, for clients that want to show it.
+async fn get_program(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
+    let store = app.store.clone();
+    let source = tokio::task::spawn_blocking(move || store.source(&id))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))??
+        .ok_or_else(not_found)?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        source,
+    )
+        .into_response())
 }
 
 async fn delete_job(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {

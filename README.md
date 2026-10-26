@@ -5,8 +5,76 @@ HTTP API. It is built for the Sienci LongMill MK2 first and takes
 [gSender](https://github.com/Sienci-Labs/gsender) as its reference for how
 to talk to the machine.
 
-There is no user interface. Clients upload a program, start it, and pause,
-resume, or stop it with HTTP calls. The server owns the USB serial port.
+The sender owns the USB serial port and serves two things on the same
+address: the HTTP API, and a single-page web UI at `/` that is built on top of
+that API. Clients can use either. The UI can upload a program, start, pause,
+resume and stop it, jog, set work zero and boundaries, and follow progress
+live.
+
+## Layout
+
+This is a monorepo.
+
+| Path | What it is |
+| --- | --- |
+| `crates/gcode-sender` | The sender: serial link, job streaming, HTTP API, and the web UI it serves |
+| `crates/grbl-sim` | A simulated controller on a pseudo-terminal, used by the tests |
+| `web/` | The web UI: `index.html`, `style.css`, `app.js`, and `lib.js` (the pure logic, with tests in `lib.test.js`). Plain files, no build step |
+
+The web UI is compiled into the sender binary (`crates/gcode-sender/src/web.rs`),
+so the server is the only thing to copy onto the machine. Edit the files in
+`web/` and rebuild. The UI is plain ES5-style script and needs no build tools;
+the logic that can be wrong without anyone noticing (the toolpath parser, time
+estimates, key mapping) lives in `web/lib.js` and is checked with
+`node --test web/lib.test.js`.
+
+## Web UI
+
+The UI only offers what the machine can do right now. A button that cannot
+work is disabled and says why when you hover it, and the selected job shows a
+one-line hint about what to do next.
+
+- **Machine**: work, machine, and zero readouts for X, Y and Z, the active
+  work system, and the tab title shows state and job progress, so you can
+  watch from another window.
+- **Jog**: buttons, or the keyboard: arrow keys for X and Y, Page Up and Page
+  Down for Z, Shift for ten times the step, Esc to cancel. Keys are ignored
+  while typing in a field.
+- **Work zero**: all of G54 to G59 with their zeros, one click to switch, and
+  the zero forms apply to the system you pick.
+- **Position check**: after a reset or a lost connection, the sender asks
+  whether the machine was moved. The UI shows that question at the top of the
+  page with both answers, and says when jobs are waiting for the answer.
+- **Jobs**: upload, start, pause with tool lift, feed hold, resume (with
+  options), stop. It shows elapsed and estimated remaining time, why a job
+  paused or failed, and a preview of the toolpath drawn from the exact program
+  that was uploaded (`GET /jobs/{id}/program`), with a warning if it would
+  leave the boundaries from the current work zero.
+- **Settings** and **Boundaries**: saving a setting keeps the ones the form
+  does not show.
+
+![Overview](docs/screenshots/overview.png)
+![A paused job](docs/screenshots/job-paused.png)
+![The position check](docs/screenshots/position-check.png)
+
+## Local only
+
+The sender and its UI are for the machine the controller is plugged into, and
+that is a requirement, not a default:
+
+- `--listen` must be a loopback address (`127.0.0.1` or `[::1]`, with a port).
+  The sender refuses to start with any other address, including `0.0.0.0`,
+  and it does not accept `localhost` by name. There is no option to override it.
+- Every request must name a loopback host in its `Host` header, which stops
+  DNS rebinding from making a remote site look local. A browser request that
+  carries an `Origin` must come from a loopback page. Other sites therefore
+  cannot send commands, such as a jog, through the browser of someone who
+  happens to be using the sender. Such requests get `403`.
+
+Open the UI at `http://127.0.0.1:8080/` (or `http://localhost:8080/`) on the
+machine itself. To use it from another computer, reach the machine over a
+remote desktop session or an SSH tunnel to its loopback port, not by changing
+`--listen`.
 
 ## Supported controllers
 
@@ -32,7 +100,7 @@ cargo run --release -p gcode-sender -- --port /dev/ttyACM0 --data-dir ./data
 | --- | --- | --- |
 | `--port` | (required) | Serial port of the controller |
 | `--baud` | `115200` | Baud rate |
-| `--listen` | `127.0.0.1:8080` | HTTP address; port `0` picks a free one |
+| `--listen` | `127.0.0.1:8080` | HTTP address, which must be loopback; port `0` picks a free one. See [Local only](#local-only) |
 | `--data-dir` | `./data` | Where jobs are stored |
 | `--rx-reserve` | `8` | Bytes of the RX buffer left unused as a margin |
 | `--poll-ms` | `200` | Status report interval |
@@ -58,6 +126,7 @@ identified yet.
 | `POST /jobs?name=<name>` | Upload a program; the body is the G-code text. Returns `201` |
 | `GET /jobs` | List jobs, oldest first |
 | `GET /jobs/{id}` | One job, with live progress while it runs |
+| `GET /jobs/{id}/program` | The program as uploaded, as plain text, so its line numbers match `last_acked_line` and `line_errors` |
 | `DELETE /jobs/{id}` | Delete a job that is not active |
 | `POST /jobs/{id}/start` | Start streaming. Also re-runs a finished job from the top |
 | `POST /jobs/{id}/pause` | Stop the machine, lift the tool and free the machine for jogging; see below. A body of `{"lift": false}` makes it a plain feed hold |
@@ -465,5 +534,10 @@ The tests need Linux or macOS for pseudo-terminals.
 - Probing and overrides.
 - Reading and changing the controller's `$` settings.
 - Resuming incremental programs.
+- A job that starts and finishes between two events may never get its final
+  `job` event on `GET /events`, since the stream only reports what it sees
+  between samples. The web UI re-reads `GET /jobs` after its own actions and
+  when the active job ends, so it is not affected, but other stream clients
+  should re-read `GET /jobs/{id}` when they start or resume a job.
 - Testing against a real LongMill. The simulator follows the Grbl 1.1
   documentation and gSender's behaviour, but real hardware has quirks.

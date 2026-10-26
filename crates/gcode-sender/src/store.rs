@@ -275,6 +275,19 @@ impl JobStore {
         }
     }
 
+    /// The program as it was uploaded, so its line numbers match a job's
+    /// `last_acked_line` and `line_errors`. `None` for an unknown job.
+    pub fn source(&self, id: &str) -> Result<Option<String>> {
+        let Some(dir) = self.dir(id) else {
+            return Ok(None);
+        };
+        match std::fs::read_to_string(dir.join("program.gcode")) {
+            Ok(source) => Ok(Some(source)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn program(&self, id: &str) -> Result<Vec<ProgramLine>> {
         let dir = self.dir(id).context("invalid job id")?;
         let source = std::fs::read_to_string(dir.join("program.gcode"))?;
