@@ -66,7 +66,9 @@ impl Status {
 }
 
 pub fn parse(line: &str) -> Response {
-    let line = line.trim();
+    // Line noise can sit in front of a reply, or after it, when the bytes
+    // arrived without a line end of their own. The reply is still there.
+    let line = line.trim_matches(|c: char| c.is_whitespace() || c.is_control() || c == '\u{FFFD}');
     if line == "ok" {
         return Response::Ok;
     }
