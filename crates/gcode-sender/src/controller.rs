@@ -713,6 +713,7 @@ impl Actor {
             if let Err(e) = result {
                 warn!(error = %e, "serial connection lost");
                 self.machine.last_error = Some(format!("serial connection lost: {e}"));
+                self.pending = None;
                 return;
             }
             self.save_progress(false);
@@ -756,7 +757,7 @@ impl Actor {
                 self.machine.last_error = Some("an acknowledgement was lost".into());
                 self.soft_reset(s).await?;
             } else {
-                clear_inflight(s);
+                self.forget_inflight(s);
             }
         }
 
@@ -816,6 +817,10 @@ impl Actor {
                 warn!(code, "alarm");
                 self.machine.alarm = Some(code);
                 self.machine.alarm_message = Some(grbl::alarm_message(code).into());
+                // An alarm throws away what the controller had buffered, so
+                // the lines in flight will never be acknowledged. Forget them
+                // now, or the next job would be counted against them.
+                self.forget_inflight(s);
                 if self
                     .job
                     .as_ref()
@@ -844,7 +849,7 @@ impl Actor {
                 if s.awaiting_reset.is_some() {
                     self.after_reset(s).await?;
                 } else {
-                    clear_inflight(s);
+                    self.forget_inflight(s);
                     self.jog_target = None;
                     if self.job.is_some() {
                         self.finish_job(
@@ -1116,9 +1121,10 @@ impl Actor {
                 }
             }
             Origin::Job(index) => {
-                if let Some(job) = &mut self.job {
+                if let Some(job) = &mut self.job
+                    && let Some(line) = job.lines.get(index).cloned()
+                {
                     job.record.acked_lines += 1;
-                    let line = &job.lines[index];
                     job.record.last_acked_line = Some(line.number);
                     job.dirty = true;
                     if let Some(code) = error {
@@ -2033,10 +2039,22 @@ impl Actor {
         Ok(())
     }
 
+    /// Drops everything in flight. A position change that was waiting for
+    /// its zero sync is abandoned with it, and reconciliation is due again:
+    /// the record still holds the frame the jobs were stored in, so making
+    /// the change again from it is safe, while leaving it pending would stop
+    /// the position from ever being recorded.
+    fn forget_inflight(&mut self, s: &mut Session) {
+        clear_inflight(s);
+        if self.pending.take().is_some() {
+            s.reconciled = false;
+        }
+    }
+
     /// The controller has reset after a stop: nothing sent before survives.
     async fn after_reset(&mut self, s: &mut Session) -> std::io::Result<()> {
         s.awaiting_reset = None;
-        clear_inflight(s);
+        self.forget_inflight(s);
         self.jog_target = None;
         s.info.next_at = None;
         let Some(job) = &mut self.job else {

@@ -124,6 +124,17 @@ struct State {
     error_rules: Vec<(String, u32)>,
     stalled: bool,
     drop_acks: usize,
+    /// Acknowledge nothing for the next line containing each pattern.
+    mute_rules: Vec<String>,
+    mute_next_ack: bool,
+    /// Lose the next `n` status reports.
+    lose_status: usize,
+    /// Corrupt the first byte of the next `n` replies.
+    garble: usize,
+    /// How long replies take to reach the sender.
+    latency: Duration,
+    /// Deliver output one byte at a time.
+    chunked: bool,
 }
 
 impl State {
@@ -151,11 +162,26 @@ impl State {
             error_rules: Vec::new(),
             stalled: false,
             drop_acks: 0,
+            mute_rules: Vec::new(),
+            mute_next_ack: false,
+            lose_status: 0,
+            garble: 0,
+            latency: Duration::ZERO,
+            chunked: false,
         }
     }
 
     fn reply(&mut self, s: &str) {
-        self.out.extend_from_slice(s.as_bytes());
+        let mut bytes = s.as_bytes().to_vec();
+        if self.garble > 0 {
+            self.garble -= 1;
+            // A byte that is not valid UTF-8 in place of the first character.
+            match bytes.first_mut() {
+                Some(b) => *b = 0xff,
+                None => bytes.push(0xff),
+            }
+        }
+        self.out.extend_from_slice(&bytes);
         self.out.extend_from_slice(b"\r\n");
     }
 
@@ -193,7 +219,9 @@ impl State {
     /// Acknowledges a line, unless a test asked for acknowledgements to be
     /// lost on the wire.
     fn ack(&mut self) {
-        if self.drop_acks > 0 {
+        if self.mute_next_ack {
+            self.mute_next_ack = false;
+        } else if self.drop_acks > 0 {
             self.drop_acks -= 1;
         } else {
             self.reply("ok");
@@ -207,6 +235,10 @@ impl State {
             "<{}|MPos:{x:.3},{y:.3},{z:.3}|FS:{feed},0",
             self.state_name()
         );
+        if self.lose_status > 0 {
+            self.lose_status -= 1;
+            return;
+        }
         // Like real firmware, the work offset rides along only on some reports.
         if self.reports.is_multiple_of(5) || self.wco_pending {
             self.wco_pending = false;
@@ -297,6 +329,14 @@ impl State {
     }
 
     fn execute_line(&mut self, line: &str) {
+        if let Some(i) = self
+            .mute_rules
+            .iter()
+            .position(|p| line.contains(p.as_str()))
+        {
+            self.mute_rules.remove(i);
+            self.mute_next_ack = true;
+        }
         if line.is_empty() {
             self.ack();
             return;
@@ -771,8 +811,9 @@ impl Simulator {
 
     /// Raise an alarm, as a hard limit switch would.
     pub fn trigger_alarm(&self, code: u32) {
-        // Like the real firmware, an alarm aborts motion, throws away
-        // whatever is in the RX buffer, and reinitialises with a banner.
+        // An alarm aborts motion and throws away whatever is in the RX
+        // buffer. Unlike a reset it prints no banner, so nothing announces
+        // that the controller has started afresh.
         let mut s = self.lock();
         s.rx.clear();
         s.planner.clear();
@@ -780,9 +821,7 @@ impl Simulator {
         s.hold = Hold::None;
         s.alarm = Some(code);
         s.reply(&format!("ALARM:{code}"));
-        s.reply("");
-        s.banner();
-        s.reply("[MSG:Reset to continue]");
+        s.reply("[MSG:'$X' to unlock]");
     }
 
     /// Frees the port after the sender has closed it.
@@ -879,6 +918,42 @@ impl Simulator {
     pub fn set_block_duration(&self, d: Duration) {
         self.lock().config.block_duration = d;
     }
+
+    /// Makes feed holds take `d` to settle, as a slow controller would.
+    pub fn set_hold_decel(&self, d: Duration) {
+        self.lock().config.hold_decel = d;
+    }
+
+    /// Delays everything the controller says by `d`, as a slow link would.
+    pub fn set_latency(&self, d: Duration) {
+        self.lock().latency = d;
+    }
+
+    /// Sends output one byte at a time, so responses arrive in pieces.
+    pub fn set_chunked(&self, chunked: bool) {
+        self.lock().chunked = chunked;
+    }
+
+    /// Loses the next `n` status reports (replies to `?`).
+    pub fn lose_status_reports(&self, n: usize) {
+        self.lock().lose_status = n;
+    }
+
+    /// Corrupts the next `n` replies, so they no longer parse.
+    pub fn garble_replies(&self, n: usize) {
+        self.lock().garble = n;
+    }
+
+    /// Acknowledges nothing for the next line containing `pattern`.
+    pub fn mute_ack_of(&self, pattern: &str) {
+        self.lock().mute_rules.push(pattern.to_string());
+    }
+
+    /// Presses the reset button on the controller. Unlike an unplugged
+    /// cable, the sender still has the port open and sees the banner.
+    pub fn press_reset(&self) {
+        self.lock().soft_reset();
+    }
 }
 
 impl Drop for Simulator {
@@ -895,6 +970,9 @@ fn run(master: Arc<Mutex<Option<File>>>, state: Arc<Mutex<State>>, stop: Arc<Ato
     let tick = Duration::from_millis(1);
     let mut buf = [0u8; 4096];
     let mut last = Instant::now();
+    // Output that has been produced but is still on its way to the sender.
+    let mut delayed: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+    let mut wire: VecDeque<u8> = VecDeque::new();
     while !stop.load(Ordering::Relaxed) {
         let mut incoming = Vec::new();
         if let Some(port) = master.lock().unwrap().as_mut() {
@@ -908,7 +986,7 @@ fn run(master: Arc<Mutex<Option<File>>>, state: Arc<Mutex<State>>, stop: Arc<Ato
                 }
             }
         }
-        let out = {
+        let chunked = {
             let mut s = state.lock().unwrap();
             if !s.stalled {
                 for b in incoming {
@@ -924,16 +1002,33 @@ fn run(master: Arc<Mutex<Option<File>>>, state: Arc<Mutex<State>>, stop: Arc<Ato
                 s.process_lines();
             }
             let out = std::mem::take(&mut s.out);
-            if s.stalled { Vec::new() } else { out }
+            if !s.stalled && !out.is_empty() {
+                delayed.push_back((now + s.latency, out));
+            }
+            s.chunked
         };
-        let mut pending = &out[..];
-        while !pending.is_empty() && !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        while delayed.front().is_some_and(|(due, _)| *due <= now) {
+            wire.extend(delayed.pop_front().unwrap().1);
+        }
+        while !wire.is_empty() && !stop.load(Ordering::Relaxed) {
+            let take = if chunked { 1 } else { wire.len() };
+            let chunk: Vec<u8> = wire.iter().take(take).copied().collect();
             let mut guard = master.lock().unwrap();
             let Some(port) = guard.as_mut() else {
+                // The cable is out: whatever was on its way is lost.
+                wire.clear();
+                delayed.clear();
                 break;
             };
-            match port.write(pending) {
-                Ok(n) => pending = &pending[n..],
+            match port.write(&chunk) {
+                Ok(n) => {
+                    wire.drain(..n);
+                    if chunked {
+                        drop(guard);
+                        std::thread::sleep(tick);
+                    }
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     drop(guard);
                     std::thread::sleep(tick);
