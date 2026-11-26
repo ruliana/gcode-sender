@@ -24,3 +24,25 @@ jobs:
           node --check web/lib.js
           node --check web/preview.js
           node --test web/lib.test.js
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz each target for a minute
+        run: |
+          for target in gcode_program grbl_reply json_documents stored_jobs; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

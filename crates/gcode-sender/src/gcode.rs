@@ -384,14 +384,14 @@ fn arc_extent(
     // Extremes of a circle sit at the axis crossings the sweep passes.
     for quarter in 0..4 {
         let angle = quarter as f64 * FRAC_PI_2;
-        let mut from_start = if clockwise {
+        // The start angle is in (-PI, PI], so the difference can be past a
+        // full turn in either direction. Reduce it to [0, TAU) first.
+        let from_start = if clockwise {
             start_angle - angle
         } else {
             angle - start_angle
-        };
-        while from_start < 0.0 {
-            from_start += TAU;
         }
+        .rem_euclid(TAU);
         if from_start < sweep {
             let (pa, pb) = (ca + r * angle.cos(), cb + r * angle.sin());
             extent.min[a] = extent.min[a].min(pa);
@@ -448,6 +448,27 @@ mod tests {
         assert!(m.step("G59.3").is_err());
         m.step("G59 G1 X1").unwrap();
         assert_eq!(m.modal.wcs, 59);
+    }
+
+    #[test]
+    fn a_counter_clockwise_arc_past_the_bottom_reaches_it() {
+        // From 181 degrees round a radius of 10, counter-clockwise through
+        // 270 degrees. The lowest point is 10 below the centre, and a
+        // boundary check must see it.
+        let mut m = Interpreter::new(
+            [
+                10.0 * (181f64).to_radians().cos(),
+                10.0 * (181f64).to_radians().sin(),
+                0.0,
+            ],
+            [[0.0; 3]; 6],
+            54,
+        );
+        let extent = m
+            .step("G3 X2.079116 Y-9.781476 I9.998477 J0.174524")
+            .unwrap()
+            .unwrap();
+        assert!((extent.min[1] + 10.0).abs() < 1e-3, "{extent:?}");
     }
 
     #[test]

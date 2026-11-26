@@ -1,16 +1,11 @@
-mod bounds;
 mod controller;
-mod gcode;
-mod grbl;
 mod http;
 mod pairing;
-mod position;
-mod program;
-mod settings;
-mod store;
 mod tls;
 mod web;
-mod work;
+
+// The pure parts live in the library so tests and fuzz targets can reach them.
+use gcode_sender::{bounds, gcode, grbl, position, program, settings, store, work};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

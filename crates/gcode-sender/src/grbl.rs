@@ -110,7 +110,7 @@ pub fn work_zero_message(tag: &str, body: &str) -> Option<(usize, [f64; 3])> {
     let index = crate::work::SYSTEMS
         .iter()
         .position(|s| tag.eq_ignore_ascii_case(&format!("G{s}")))?;
-    let v = parse_floats(body);
+    let v = parse_floats(body)?;
     (v.len() >= 3).then(|| (index, [v[0], v[1], v[2]]))
 }
 
@@ -123,8 +123,11 @@ pub fn active_system_message(body: &str) -> Option<u32> {
     })
 }
 
-fn parse_floats(s: &str) -> Vec<f64> {
-    s.split(',').filter_map(|v| v.trim().parse().ok()).collect()
+/// Reads a comma-separated list of numbers. One field that is not a number
+/// makes the whole list unreadable: dropping it would move every field after
+/// it onto the wrong axis.
+fn parse_floats(s: &str) -> Option<Vec<f64>> {
+    s.split(',').map(|v| v.trim().parse().ok()).collect()
 }
 
 fn parse_status(body: &str) -> Status {
@@ -143,11 +146,11 @@ fn parse_status(body: &str) -> Status {
             continue;
         };
         match key {
-            "MPos" => status.machine_position = Some(parse_floats(value)),
-            "WPos" => status.work_position = Some(parse_floats(value)),
-            "WCO" => status.work_offset = Some(parse_floats(value)),
+            "MPos" => status.machine_position = parse_floats(value),
+            "WPos" => status.work_position = parse_floats(value),
+            "WCO" => status.work_offset = parse_floats(value),
             "FS" | "F" => {
-                let v = parse_floats(value);
+                let v = parse_floats(value).unwrap_or_default();
                 status.feed_rate = v.first().copied();
                 status.spindle_speed = v.get(1).copied();
             }
