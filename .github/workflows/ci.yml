@@ -38,7 +38,7 @@ jobs:
       - name: Fuzz each target for a minute
         run: |
           for target in gcode_program grbl_reply json_documents stored_jobs; do
-            cargo fuzz run "$target" -- -max_total_time=60
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60
           done
       - name: Keep any crashing input
         if: failure()
