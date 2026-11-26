@@ -26,3 +26,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 grbl-sim = { path = "../grbl-sim" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 tempfile = "3"
+proptest = "1"

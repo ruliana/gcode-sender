@@ -603,6 +603,26 @@ GCODE_SENDER_TEST_LOG=1 cargo test -- --nocapture   # with server logs
 
 The tests need Linux or macOS for pseudo-terminals.
 
+The pure parts of the sender (the G-code interpreter, the reply parser, work
+offsets, boundaries, settings and the job store) are also covered by property
+tests (`crates/gcode-sender/tests/prop_*.rs`, using
+[proptest](https://crates.io/crates/proptest)). They feed the parsers arbitrary
+and damaged input, check arc extents against sampled circles, and check that a
+bad HTTP body never gets a `500`.
+
+Fuzz targets live in `fuzz/` and use [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+(`cargo install cargo-fuzz`, then a nightly toolchain). Run one for a while
+with:
+
+```sh
+cargo +nightly fuzz run gcode_program      # G-code files, interpreter and boundaries
+cargo +nightly fuzz run grbl_reply         # lines from the controller
+cargo +nightly fuzz run json_documents     # JSON bodies the HTTP API reads
+cargo +nightly fuzz run stored_jobs        # damaged files in the data directory
+```
+
+CI runs each target for a minute.
+
 ## Not done yet
 
 - Probing and overrides.

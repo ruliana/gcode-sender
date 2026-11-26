@@ -81,6 +81,14 @@ pub fn check(
                 continue;
             };
             let (low, high) = (extent.min[axis], extent.max[axis]);
+            // A comparison with NaN is false, so a NaN would pass every check
+            // below. Refuse it outright.
+            if !low.is_finite() || !high.is_finite() {
+                return Err(format!(
+                    "line {} ({}) moves {name} to a position that is not a finite number",
+                    line.number, line.text
+                ));
+            }
             let bad = if low < min - EPSILON {
                 low
             } else if high > max + EPSILON {
@@ -95,4 +103,45 @@ pub fn check(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::prepare;
+
+    fn limits() -> Bounds {
+        Bounds {
+            x: Some([-100.0, 100.0]),
+            y: Some([-100.0, 100.0]),
+            z: None,
+        }
+    }
+
+    fn work() -> WorkOffsets {
+        WorkOffsets {
+            system: 54,
+            zeros: [[0.0; 3]; 6],
+        }
+    }
+
+    #[test]
+    fn a_program_inside_the_limits_passes() {
+        let program = prepare("G0 X10 Y10\nG1 X-50 Y20 F300\nG2 X0 Y0 I50 J0");
+        assert_eq!(check(&limits(), &program, [0.0; 3], &work()), Ok(()));
+    }
+
+    #[test]
+    fn a_move_past_the_limit_names_its_line() {
+        let program = prepare("G0 X10\nG1 X150");
+        let err = check(&limits(), &program, [0.0; 3], &work()).unwrap_err();
+        assert!(err.starts_with("line 2 (G1 X150)"), "{err}");
+    }
+
+    #[test]
+    fn a_coordinate_too_large_to_be_a_number_is_refused() {
+        // Digits this long read as infinity, which no boundary can contain.
+        let program = prepare(&format!("G1 X{}", "9".repeat(400)));
+        assert!(check(&limits(), &program, [0.0; 3], &work()).is_err());
+    }
 }
